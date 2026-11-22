@@ -4,6 +4,8 @@ A shell and a Python REPL in one executable. Every line is Python if it parses
 as Python, and a shell command otherwise. It embeds the CPython that is installed
 on your system, so `import` finds the same modules your `python` does.
 
+![pysh screenshot](screenshot.png)
+
 ```
 ~/s/c/pysh(main)> x = 6 * 7
 ~/s/c/pysh(main)> x
@@ -146,3 +148,7 @@ p.close()
 elf = ELF("/bin/ls", checksec=False)
 elf.arch, elf.pie, hex(elf.entry)           # ('amd64', True, '0x6d30')
 ```
+
+## License
+
+MIT; see [LICENSE](LICENSE).

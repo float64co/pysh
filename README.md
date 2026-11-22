@@ -53,18 +53,35 @@ pysh --help | --version
 A line is treated as a command when it doesn't parse as Python, or when it starts with
 a name that isn't bound in Python but is a program, builtin or alias (`ls -la`, `id -u`).
 
-The shell side has pipes, `&& || ; &`, redirects (`> >> < 2> 2>&1 &>`), quotes, globs,
-`~`, `$VAR` and `VAR=x cmd`. There are no shell loops or functions; use Python.
-Builtins: `cd exit export unset alias unalias jobs source history type help`.
+The shell side has pipes (`|`, and `|&` to include stderr), `&& || ; &`, redirects
+(`> >> < 2> 2>&1 >&2 &>`), quotes, globs, `~`, `$VAR`, `VAR=x cmd`, brace expansion
+(`{a,b}`, `{1..10..2}`, `{01..12}`), arithmetic (`$((1 + 2 * $X))`), here-documents
+(`<<EOF`, `<<-EOF`, `<<'EOF'`) and here-strings (`<<< text`). There are no shell loops or
+functions; use Python.
+Builtins: `cd exit export unset alias unalias jobs fg bg wait kill source history type help`.
+
+**Job control**: `Ctrl-Z` stops the foreground job, `jobs`/`fg %2`/`bg`/`kill %1`/`wait`
+manage it, `cmd &` runs in the background, finished jobs are reported before the next prompt,
+and `Ctrl-C` only interrupts the foreground job.
 
 ## Interactive features
 
 - **Autosuggestions**: grey text from history. `→`/`End`/`Ctrl-F` accept, `Alt-F` takes a word.
 - **Highlighting**: valid commands blue, unknown red, strings yellow, paths underlined.
 - **Tab completion menu** with descriptions: commands from man pages, files by type/size,
-  Python attributes by type, flags parsed from `cmd --help`. Tab cycles, Enter accepts, Esc cancels.
+  Python attributes by type, flags parsed from `cmd --help`. Tab cycles, Enter runs the selection, Esc cancels.
 - **`Ctrl-R`** history search menu; `↑`/`↓` search history by prefix.
 - **Prompt**: `user@host ~/s/c/pysh(branch)>`, with the git branch in white.
+
+## Tests
+
+```sh
+make test                      # unittest suite in tests/ (shell, parser, line editor, job control)
+PYSH=./pysh-static python3 -m unittest discover -s tests -k Parser
+```
+
+The line-editor and job-control tests run pysh on a pty and render its output with a small
+VT100 emulator (`tests/term.py`), so they check what a terminal would show, including wrapping.
 
 ## Configuration
 
@@ -81,9 +98,9 @@ History lives in `~/.pysh_history` (`PYSH_HISTFILE` to change).
 
 ## Limitations
 
-- No job control beyond `&` and `jobs`.
-- The line editor doesn't redraw correctly when a line wraps past the terminal width.
+- Job control needs Python 3.11+ (`process_group`) and a controlling terminal.
 - `make static` cannot import C-extension modules.
+- The line editor assumes the terminal doesn't resize while you're typing a line.
 
 ## Examples
 

@@ -6,6 +6,7 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <poll.h>
 #include <string.h>
@@ -41,19 +42,154 @@ static int is_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
 static int prev_ch(const char *b, int p) { do p--; while (p > 0 && is_cont(b[p])); return p; }
 static int next_ch(const char *b, int len, int p) { do p++; while (p < len && is_cont(b[p])); return p; }
 
+static int g_log = -1;     /* PYSH_TTYLOG=file: copy of everything the editor writes, for bug reports */
 static void out(const char *s, size_t n) {
+    if (g_log >= 0) { ssize_t r = write(g_log, s, n); (void)r; }
     while (n) { ssize_t w = write(1, s, n); if (w <= 0) { if (errno == EINTR) continue; return; } s += w; n -= w; }
 }
 static void outs(const char *s) { out(s, strlen(s)); }
+static void outf(const char *fmt, int n) { char t[32]; snprintf(t, sizeof t, fmt, n); outs(t); }
 
-static PyObject *g_suggest, *g_highlight;
+/* ---- display width (approximate wcwidth) ---- */
+static int cpwidth(unsigned cp) {
+    if (cp == 0) return 0;
+    if ((cp >= 0x300 && cp <= 0x36F) || (cp >= 0x200B && cp <= 0x200F) || (cp >= 0xFE00 && cp <= 0xFE0F)) return 0;
+    if ((cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0xA4CF) || (cp >= 0xAC00 && cp <= 0xD7A3) ||
+        (cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0xFE30 && cp <= 0xFE6F) || (cp >= 0xFF00 && cp <= 0xFF60) ||
+        (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1F64F) || (cp >= 0x1F900 && cp <= 0x1F9FF) ||
+        (cp >= 0x20000 && cp <= 0x3FFFD)) return 2;
+    return 1;
+}
+/* width of the first n bytes of s; skips CSI escape sequences (for prompts / highlighted text) */
+static int text_width(const char *s, int n) {
+    int w = 0;
+    for (int i = 0; i < n;) {
+        unsigned char c = s[i];
+        if (c == 0x1b && i + 1 < n && s[i+1] == '[') {
+            i += 2; while (i < n && !(s[i] >= 0x40 && s[i] <= 0x7e)) i++;
+            i++; continue;
+        }
+        unsigned cp; int l;
+        if (c < 0x80) { cp = c; l = 1; }
+        else if (c >= 0xF0) { cp = c & 7; l = 4; }
+        else if (c >= 0xE0) { cp = c & 15; l = 3; }
+        else if (c >= 0xC0) { cp = c & 31; l = 2; }
+        else { i++; continue; }
+        for (int k = 1; k < l && i + k < n; k++) cp = (cp << 6) | (s[i+k] & 63);
+        i += l;
+        w += cpwidth(cp);
+    }
+    return w;
+}
+
+static void term_size(int *w, int *h) {
+    struct winsize ws;
+    *w = 80; *h = 24;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0) { if (ws.ws_col) *w = ws.ws_col; if (ws.ws_row) *h = ws.ws_row; }
+}
+
+static PyObject *g_suggest, *g_highlight, *g_search;
 static int m_active, m_search;
-static PyObject *g_search;
 static char g_sug[MAXLINE];   /* current suggestion tail (only when cursor at end) */
+static int g_row;             /* cursor row relative to the first row of the prompt */
+static int g_below;           /* rows of menu currently drawn below the line */
 
-static void redraw(const char *prompt, const char *buf, int len, int pos) {
-    int back = 0;
-    for (int i = pos; i < len; i = next_ch(buf, len, i)) back++;
+/* ------------------------------------------------------ completion menu */
+static PyObject *m_items;          /* list of (full_before_cursor, display, desc) */
+static Py_ssize_t m_n;
+static int m_sel;
+static char m_tail[MAXLINE]; static int m_taillen;
+static char m_orig[MAXLINE]; static int m_origlen, m_origpos;
+
+/* display width of one UTF-8 sequence starting at p (advances *n bytes); control chars count as 1 ('?') */
+static int char_w(const char *p, int *n) {
+    unsigned char c = p[0];
+    int l = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+    for (int k = 1; k < l; k++) if (!is_cont((unsigned char)p[k])) { l = k; break; }
+    *n = l;
+    if (c < 0x20 || c == 0x7f) return 1;
+    return text_width(p, l);
+}
+static int str_w(const char *s) {
+    int w = 0, n;
+    while (*s) { w += char_w(s, &n); s += n; }
+    return w;
+}
+
+static void item(Py_ssize_t i, const char **full, const char **disp, const char **desc) {
+    PyObject *t = PyList_GetItem(m_items, i);
+    *full = PyUnicode_AsUTF8(PyTuple_GetItem(t, 0));
+    *disp = PyUnicode_AsUTF8(PyTuple_GetItem(t, 1));
+    *desc = PyUnicode_AsUTF8(PyTuple_GetItem(t, 2));
+    if (!*full) { PyErr_Clear(); *full = ""; }
+    if (!*disp) { PyErr_Clear(); *disp = ""; }
+    if (!*desc) { PyErr_Clear(); *desc = ""; }
+}
+static void pad(int n) { while (n-- > 0) outs(" "); }
+
+/* print s clipped to `room` columns (control characters shown as '?'); returns the columns used */
+static int out_w(const char *s, int room) {
+    int used = 0, n;
+    while (*s) {
+        int w = char_w(s, &n);
+        if (used + w > room) break;
+        unsigned char c = s[0];
+        if (c < 0x20 || c == 0x7f) outs("?"); else out(s, n);
+        used += w; s += n;
+    }
+    return used;
+}
+
+/* Draw the menu below the line (cursor is on the line's last row). Returns the rows drawn;
+ * the cursor is left on the last menu row. */
+static int menu_draw(int tw, int th, int endrow) {
+    int colw = 0;
+    for (Py_ssize_t i = 0; i < m_n; i++) {
+        const char *f, *d, *e; item(i, &f, &d, &e);
+        int w = str_w(d) + (*e ? 2 + str_w(e) : 0);
+        if (w > colw) colw = w;
+    }
+    if (colw > tw - 3) colw = tw - 3;
+    int cols = tw / (colw + 2); if (cols < 1 || m_search) cols = 1;
+    int rows = (int)((m_n + cols - 1) / cols);
+    int maxrows = th - endrow - 2; if (maxrows < 1) maxrows = 1;
+    int first = 0, shown = rows;
+    if (rows > maxrows) {
+        shown = maxrows;
+        int selrow = m_sel >= 0 ? m_sel / cols : 0;
+        if (selrow >= maxrows) first = selrow - maxrows + 1;
+    }
+    for (int r = first; r < first + shown; r++) {
+        outs("\r\n");
+        for (int c = 0; c < cols; c++) {
+            Py_ssize_t i = (Py_ssize_t)r * cols + c;
+            if (i >= m_n) break;
+            const char *f, *d, *e; item(i, &f, &d, &e);
+            int used;
+            if (i == m_sel) outs("\x1b[7m");
+            used = out_w(d, colw);
+            if (*e && colw - used > 3) {
+                outs(i == m_sel ? "  " : "  \x1b[90m");
+                used += 2 + out_w(e, colw - used - 2);
+            }
+            outs("\x1b[0m");
+            pad(colw - used + 2);
+        }
+    }
+    return shown;
+}
+
+static void menu_close(void) {
+    m_active = 0; m_search = 0;
+    Py_CLEAR(m_items);
+}
+
+/* ------------------------------------------------------------- redraw */
+/* Repaint prompt + text (+ suggestion) + menu from the first row of the prompt, then park the
+ * cursor at byte offset `pos`.  Wrapping is handled by tracking the terminal width. */
+static void redraw(const char *prompt, int pw, const char *buf, int len, int pos) {
+    int W, H;
+    term_size(&W, &H);
     g_sug[0] = 0;
     if (pos == len && len > 0 && g_suggest != Py_None && !m_active) {
         PyObject *r = PyObject_CallFunction(g_suggest, "s#", buf, (Py_ssize_t)len);
@@ -63,17 +199,30 @@ static void redraw(const char *prompt, const char *buf, int len, int pos) {
             Py_DECREF(r);
         } else PyErr_Clear();
     }
+    if (g_row > 0) outf("\x1b[%dA", g_row);
     outs("\r"); outs(prompt);
     PyObject *h = g_highlight != Py_None ? PyObject_CallFunction(g_highlight, "s#", buf, (Py_ssize_t)len) : NULL;
     const char *hs = h && PyUnicode_Check(h) ? PyUnicode_AsUTF8(h) : NULL;
     if (hs) outs(hs); else { PyErr_Clear(); out(buf, len); }
     Py_XDECREF(h);
-    if (g_sug[0]) {
-        outs("\x1b[90m"); outs(g_sug); outs("\x1b[0m");
-        for (const char *p = g_sug; *p; p++) if (!is_cont((unsigned char)*p)) back++;
+    if (g_sug[0]) { outs("\x1b[90m"); outs(g_sug); outs("\x1b[0m"); }
+    int tw = pw + text_width(buf, len) + (g_sug[0] ? text_width(g_sug, (int)strlen(g_sug)) : 0);
+    if (tw > 0 && tw % W == 0) outs(" \r");        /* force the pending wrap so rows are predictable */
+    int endrow = tw / W;
+    outs("\x1b[J");
+    if (g_below > 0 && g_below < H) {                 /* belt and braces: blank each old menu row explicitly */
+        for (int k = 0; k < g_below; k++) outs("\x1b[1B\r\x1b[2K");
+        outf("\x1b[%dA", g_below);
     }
-    outs("\x1b[K");
-    if (back) { char t[32]; snprintf(t, sizeof t, "\x1b[%dD", back); outs(t); }
+    g_below = 0;
+    int bottom = endrow;
+    if (m_active && m_n > 0 && m_items) { g_below = menu_draw(W, H, endrow); bottom += g_below; }
+    int tc = pw + text_width(buf, pos), tr = tc / W, tcol = tc % W;
+    if (bottom > tr) outf("\x1b[%dA", bottom - tr);
+    else if (bottom < tr) outf("\x1b[%dB", tr - bottom);
+    outs("\r");
+    if (tcol) outf("\x1b[%dC", tcol);
+    g_row = tr;
 }
 
 static void ins(char *buf, int *len, int *pos, const char *s, int n) {
@@ -98,107 +247,17 @@ static int word_fwd(const char *b, int len, int p) {
     return p;
 }
 
-/* ------------------------------------------------------ completion menu */
-static PyObject *m_items;          /* list of (full_before_cursor, display, desc) */
-static Py_ssize_t m_n;
-static int m_sel, m_rows;
-static char m_tail[MAXLINE]; static int m_taillen;
-static char m_orig[MAXLINE]; static int m_origlen, m_origpos;
-
-static int cps(const char *s) { int n = 0; for (; *s; s++) if (!is_cont((unsigned char)*s)) n++; return n; }
-static void term_size(int *w, int *h) {
-    struct winsize ws;
-    *w = 80; *h = 24;
-    if (ioctl(1, TIOCGWINSZ, &ws) == 0) { if (ws.ws_col) *w = ws.ws_col; if (ws.ws_row) *h = ws.ws_row; }
-}
-static void item(Py_ssize_t i, const char **full, const char **disp, const char **desc) {
-    PyObject *t = PyList_GetItem(m_items, i);
-    *full = PyUnicode_AsUTF8(PyTuple_GetItem(t, 0));
-    *disp = PyUnicode_AsUTF8(PyTuple_GetItem(t, 1));
-    *desc = PyUnicode_AsUTF8(PyTuple_GetItem(t, 2));
-    if (!*full) { PyErr_Clear(); *full = ""; }
-    if (!*disp) { PyErr_Clear(); *disp = ""; }
-    if (!*desc) { PyErr_Clear(); *desc = ""; }
-}
-static void pad(int n) { while (n-- > 0) outs(" "); }
-
-/* print up to `room` code points of s */
-static void out_cp(const char *s, int room) {
-    const char *p = s; int k = 0;
-    while (*p) {
-        const char *q = p + 1; while (is_cont((unsigned char)*q)) q++;
-        if (++k > room) break;
-        p = q;
-    }
-    out(s, p - s);
-}
-
-/* draw the menu under the current line, then move the cursor back up */
-static void menu_draw(void) {
-    int tw, th, colw = 0;
-    term_size(&tw, &th);
-    for (Py_ssize_t i = 0; i < m_n; i++) {
-        const char *f, *d, *e; item(i, &f, &d, &e);
-        int w = cps(d) + (*e ? 2 + cps(e) : 0);
-        if (w > colw) colw = w;
-    }
-    if (colw > tw - 3) colw = tw - 3;
-    int cols = tw / (colw + 2); if (cols < 1 || m_search) cols = 1;
-    int rows = (int)((m_n + cols - 1) / cols);
-    int maxrows = th - 3; if (maxrows < 3) maxrows = 3;
-    int first = 0, shown = rows;
-    if (rows > maxrows) {
-        shown = maxrows;
-        int selrow = m_sel >= 0 ? m_sel / cols : 0;
-        if (selrow >= maxrows) first = selrow - maxrows + 1;
-    }
-    for (int r = first; r < first + shown; r++) {
-        outs("\r\n");
-        for (int c = 0; c < cols; c++) {
-            Py_ssize_t i = (Py_ssize_t)r * cols + c;
-            if (i >= m_n) break;
-            const char *f, *d, *e; item(i, &f, &d, &e);
-            int dl = cps(d), used;
-            if (dl > colw) dl = colw;
-            if (i == m_sel) outs("\x1b[7m");
-            out_cp(d, colw);
-            used = dl;
-            if (*e && colw - dl > 3) {
-                outs(i == m_sel ? "  " : "  \x1b[90m");
-                int room = colw - dl - 2, el = cps(e); if (el > room) el = room;
-                out_cp(e, room); used += 2 + el;
-            }
-            outs("\x1b[0m");
-            pad(colw - used + 2);
-        }
-    }
-    char t[32]; snprintf(t, sizeof t, "\x1b[%dA", shown); outs(t);
-    m_rows = shown;
-}
-static void menu_clear(void) {
-    if (m_rows) outs("\r\n\x1b[J\x1b[A");
-    m_rows = 0;
-}
-static void menu_close(void) {
-    menu_clear();
-    m_active = 0; m_search = 0;
-    Py_CLEAR(m_items);
-}
-
-/* Ctrl-R: re-run the history query for what's in the buffer and redraw the menu */
-static void search_refresh(const char *prompt, const char *buf, int len, int pos) {
-    menu_clear();
+/* Ctrl-R: re-run the history query for what's in the buffer */
+static void search_refresh(void *unused, const char *buf, int len) {
+    (void)unused;
     Py_CLEAR(m_items);
     PyObject *r = PyObject_CallFunction(g_search, "s#", buf, (Py_ssize_t)len);
     if (!r || !PyList_Check(r)) { PyErr_Clear(); Py_XDECREF(r); r = PyList_New(0); }
     m_items = r; m_n = PyList_Size(r);
     m_sel = m_n ? 0 : -1;
-    menu_draw();
-    redraw(prompt, buf, len, pos);
 }
 
-/* readline(prompt, history_list, completer) -> str
- * completer(text_before_cursor) -> (replacement_for_that_text, list_or_None) */
+/* readline(prompt, history, completer, suggest, highlight, search) -> str */
 static PyObject *le_readline(PyObject *self, PyObject *args) {
     const char *prompt; PyObject *hist, *comp;
     if (!PyArg_ParseTuple(args, "sOOOOO", &prompt, &hist, &comp, &g_suggest, &g_highlight, &g_search)) return NULL;
@@ -216,34 +275,46 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
     Py_ssize_t nh = PyList_Size(hist), hi = nh;
     PyObject *result = NULL;
     int saved_len = 0;
+    int pw = text_width(prompt, (int)strlen(prompt));
     buf[0] = 0;
-    outs("\r"); outs(prompt);
+    m_active = m_search = 0; Py_CLEAR(m_items); g_row = 0; g_below = 0;
+    if (g_log < 0 && getenv("PYSH_TTYLOG")) g_log = open(getenv("PYSH_TTYLOG"), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (g_log >= 0) { int w, h; char t[64]; term_size(&w, &h); snprintf(t, sizeof t, "\n<<readline %dx%d>>\n", w, h); out(t, strlen(t)); }
+    {   /* zsh-style "prompt space": if the previous output left the cursor mid-line, mark it with a
+         * reverse-video % and start the prompt on a fresh row; at column 0 this is invisible */
+        int w, h; term_size(&w, &h);
+        outs("\x1b[7m%\x1b[0m");
+        for (int i = 1; i < w; i++) outs(" ");
+        outs("\r\x1b[K");
+    }
+    redraw(prompt, pw, buf, len, pos);
 
+#define REDRAW() redraw(prompt, pw, buf, len, pos)
     for (;;) {
         int c = key(-1);
         if (c == -2) { PyErr_SetString(PyExc_EOFError, "eof"); break; }
-        int changed = 1;
+        int changed = 1, refresh = 1;
         if (m_active && m_search && (c == '\r' || c == '\n')) {      /* take the chosen history entry */
             if (m_sel >= 0) {
                 const char *f, *d, *e; item(m_sel, &f, &d, &e);
                 int n = (int)strnlen(f, MAXLINE - 1); memcpy(buf, f, n); len = pos = n;
             }
-            menu_close(); redraw(prompt, buf, len, pos); continue;
+            menu_close(); REDRAW(); continue;
         }
-        if (m_active && m_search && c == 3) { menu_close(); redraw(prompt, buf, len, pos); }
+        if (m_active && m_search && c == 3) { menu_close(); REDRAW(); }
         if (m_active && !m_search && c != 9 && c != 27 && !((c == '\r' || c == '\n') && m_sel >= 0)) {
-            menu_close(); redraw(prompt, buf, len, pos);
+            menu_close(); REDRAW();
         }
-        if (m_active && !m_search && (c == '\r' || c == '\n')) {          /* accept selection, don't run */
-            menu_close(); redraw(prompt, buf, len, pos); continue;
-        }
+        if (m_active && !m_search && (c == '\r' || c == '\n'))            /* selection is already in the buffer: close the menu and run it */
+            menu_close(), REDRAW();
         switch (c) {
         case '\r': case '\n':
-            { PyObject *sv = g_suggest; g_suggest = Py_None; redraw(prompt, buf, len, len); g_suggest = sv; }
+            { PyObject *sv = g_suggest; g_suggest = Py_None; pos = len; REDRAW(); g_suggest = sv; }
             outs("\r\n");
             result = PyUnicode_DecodeUTF8(buf, len, "replace");
             goto done;
         case 3: /* ^C */
+            pos = len; { PyObject *sv = g_suggest; g_suggest = Py_None; REDRAW(); g_suggest = sv; }
             outs("^C\r\n");
             PyErr_SetNone(PyExc_KeyboardInterrupt);
             goto done;
@@ -258,7 +329,7 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
         case 11: len = pos; break;                       /* ^K */
         case 21: del(buf, &len, 0, pos, &pos); break;    /* ^U */
         case 23: del(buf, &len, word_back(buf, pos), pos, &pos); break; /* ^W */
-        case 12: outs("\x1b[H\x1b[2J"); break;           /* ^L */
+        case 12: outs("\x1b[H\x1b[2J"); g_row = 0; break;  /* ^L */
         case 127: case 8:
             if (pos > 0) del(buf, &len, prev_ch(buf, pos), pos, &pos);
             break;
@@ -268,14 +339,13 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
             goto hist_nav_dispatch;
         }
         case 18: /* ^R: history search menu */
-            if (m_active && m_search) { m_sel = m_n ? (int)((m_sel + 1) % m_n) : -1; goto menu_select; }
+            if (m_active && m_search) { m_sel = m_n ? (int)((m_sel + 1) % m_n) : -1; refresh = 0; goto redraw_now; }
             if (g_search == Py_None) { changed = 0; break; }
             memcpy(m_orig, buf, len); m_origlen = len; m_origpos = pos; m_taillen = 0;
             m_active = 1; m_search = 1; m_n = 0;
-            search_refresh(prompt, buf, len, pos);
-            changed = 0; break;
+            break;
         case 9: { /* TAB: complete / cycle the menu */
-            if (m_active) { m_sel = (int)((m_sel + 1) % m_n); goto menu_select; }
+            if (m_active) { if (m_n) m_sel = (int)((m_sel + 1) % m_n); goto menu_select; }
             PyObject *r = PyObject_CallFunction(comp, "s#", buf, (Py_ssize_t)pos);
             if (!r) { PyErr_Print(); changed = 0; break; }
             const char *rep; PyObject *lst;
@@ -290,7 +360,6 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
                     Py_INCREF(lst); m_items = lst; m_n = PyList_Size(lst); m_sel = -1; m_active = 1;
                 }
                 if (n + m_taillen < MAXLINE) { memcpy(buf, rep, n); memcpy(buf + n, m_tail, m_taillen); len = n + m_taillen; pos = n; }
-                if (m_active) { menu_draw(); redraw(prompt, buf, len, pos); changed = 0; }
             } else PyErr_Clear();
             Py_DECREF(r);
             break;
@@ -312,13 +381,12 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
             if (c2 == ';') { mod = key(50) - '0'; c2 = key(50); }
             if (m_active && (c2 == 'A' || c2 == 'B' || c2 == 'Z' || (!m_search && (c2 == 'C' || c2 == 'D')))) {
                 if (m_n == 0) { changed = 0; break; }
-                int w, h; term_size(&w, &h);
                 if (m_sel < 0) m_sel = (c2 == 'D' || c2 == 'A' || c2 == 'Z') ? (int)m_n - 1 : 0;
                 else if (c2 == 'C' || c2 == 'B') m_sel = (int)((m_sel + 1) % m_n);
                 else m_sel = (int)((m_sel + m_n - 1) % m_n);
                 goto menu_select;
             }
-            if (m_active && !m_search) { menu_close(); redraw(prompt, buf, len, pos); }
+            if (m_active && !m_search) { menu_close(); REDRAW(); }
             switch (c2) {
             case 'A': c = 16; goto hist_nav_dispatch;
             case 'B': c = 14; goto hist_nav_dispatch;
@@ -367,28 +435,43 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
         }
         goto redraw_now;
     menu_select:
-        {
+        refresh = 0;
+        if (m_n > 0 && m_sel >= 0 && !m_search) {
             const char *f, *d, *e; item(m_sel, &f, &d, &e);
             int n = strlen(f);
-            if (!m_search && n + m_taillen < MAXLINE) { memcpy(buf, f, n); memcpy(buf + n, m_tail, m_taillen); len = n + m_taillen; pos = n; }
-            menu_clear();
-            menu_draw(); redraw(prompt, buf, len, pos);
-            changed = 0;
+            if (n + m_taillen < MAXLINE) { memcpy(buf, f, n); memcpy(buf + n, m_tail, m_taillen); len = n + m_taillen; pos = n; }
         }
-        goto skip_redraw;
     redraw_now:
-        if (changed) redraw(prompt, buf, len, pos);
-        if (m_active && m_search) search_refresh(prompt, buf, len, pos);
-    skip_redraw: ;
+        if (changed) {
+            if (m_active && m_search && refresh) search_refresh(NULL, buf, len);
+            REDRAW();
+        }
     }
 done:
-    if (m_active) menu_close();
+    m_active = m_search = 0; Py_CLEAR(m_items);
     tcsetattr(0, TCSADRAIN, &old);
     return result;
 }
 
+static PyObject *le_getmode(PyObject *self, PyObject *args) {
+    struct termios t;
+    if (tcgetattr(0, &t) < 0) return PyErr_SetFromErrno(PyExc_OSError);
+    return PyBytes_FromStringAndSize((const char *)&t, sizeof t);
+}
+static PyObject *le_setmode(PyObject *self, PyObject *args) {
+    Py_buffer b;
+    if (!PyArg_ParseTuple(args, "y*", &b)) return NULL;
+    if (b.len != sizeof(struct termios)) { PyBuffer_Release(&b); PyErr_SetString(PyExc_ValueError, "bad mode"); return NULL; }
+    int r = tcsetattr(0, TCSADRAIN, (const struct termios *)b.buf);
+    PyBuffer_Release(&b);
+    if (r < 0) return PyErr_SetFromErrno(PyExc_OSError);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef le_methods[] = {
-    {"readline", le_readline, METH_VARARGS, "readline(prompt, history, completer)"},
+    {"readline", le_readline, METH_VARARGS, "readline(prompt, history, completer, suggest, highlight, search)"},
+    {"getmode", le_getmode, METH_NOARGS, "terminal attributes of fd 0 as bytes"},
+    {"setmode", le_setmode, METH_VARARGS, "restore terminal attributes from getmode()"},
     {NULL, NULL, 0, NULL}
 };
 static struct PyModuleDef le_mod = {PyModuleDef_HEAD_INIT, "_pyshline", NULL, -1, le_methods};

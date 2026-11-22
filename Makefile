@@ -41,3 +41,8 @@ install-static: pysh-static
 clean:
 	rm -f pysh pysh-static pysh-dynamic pysh_py.h
 .PHONY: static clean install install-static
+
+# Tests run against ./pysh by default; PYSH=./pysh-static make test to try the other build.
+test: pysh
+	python3 -m unittest discover -s tests -v
+.PHONY: test

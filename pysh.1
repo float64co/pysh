@@ -1,0 +1,235 @@
+.TH PYSH 1 "" "pysh 0.1" "User Commands"
+.SH NAME
+pysh \- a shell with an embedded Python interpreter
+.SH SYNOPSIS
+.B pysh
+.RB [ \-c
+.IR command " [" arg " ...]]"
+.br
+.B pysh
+.RI [ script " [" arg " ...]]"
+.br
+.B pysh
+.RB [ \-h | \-\-help | \-V | \-\-version ]
+.SH DESCRIPTION
+.B pysh
+is a single, binary (statically linked when built with `make static`) that is both a command shell and a Python
+read\-eval\-print loop.
+Each line is run as Python if it parses as Python and does not begin with a name
+that is not bound in Python but is an executable, builtin or alias;
+otherwise it is run as a shell command.
+So
+.B x = 6*7
+and
+.B x
+are Python, while
+.B ls \-la
+and
+.B git status
+are shell commands.
+.PP
+Python is the CPython the binary was built against.
+Its standard library and site\-packages are located through the same prefix as the
+system
+.BR python ,
+so the same pure\-Python modules are importable.
+.SH OPTIONS
+.TP
+.BI \-c " command"
+Run
+.I command
+(shell and Python lines, separated by newlines) and exit.
+Remaining arguments become
+.IR sys.argv .
+.TP
+.BR \-h ", " \-\-help
+Print usage and a summary of the syntax and exit.
+The same text is printed by the
+.B help
+builtin.
+.TP
+.BR \-V ", " \-\-version
+Print the pysh and Python versions and the Python home, then exit.
+.TP
+.I script
+Read and run lines from a file.
+.PP
+With no arguments pysh is interactive when standard input and output are terminals.
+Otherwise it reads commands from standard input.
+.SH PYTHON AND SHELL TOGETHER
+.TP
+.BI $( cmd )
+Run
+.I cmd
+and evaluate to its standard output (trailing newline removed) as a string.
+Inside a shell command it is substituted into the word, and, when unquoted,
+split on whitespace.
+.TP
+.BI !( cmd )
+Run
+.I cmd
+and evaluate to a
+.B Result
+object with the attributes
+.BR returncode ,
+.BR out ,
+.BR err ,
+.B duration
+and
+.BR cmd .
+A Result is true if the return code is zero.
+.TP
+.BI @( expr )
+In a shell command, evaluate the Python expression
+.IR expr .
+A list or tuple becomes several words.
+.TP
+.BI $ NAME
+In Python, an item of the environment:
+.B $HOME
+and
+.BR "$EDITOR = 'vi'" .
+In a shell command, ordinary variable expansion, including
+.B $?
+for the last return code.
+.TP
+.B last
+The
+.B Result
+of the most recent command.
+.TP
+.B aliases
+A dictionary of aliases.
+A string value replaces the first word of a command; a callable is called with the
+argument list and may return a string to print or an integer exit status.
+.SH SHELL SYNTAX
+Pipelines (\fB|\fR), lists (\fB;\fR, \fB&&\fR, \fB||\fR), background jobs (\fB&\fR),
+redirections (\fB>\fR, \fB>>\fR, \fB<\fR, \fB2>\fR, \fB2>&1\fR, \fB&>\fR),
+single and double quotes, backslash escapes, globbing,
+tilde expansion, and
+.IB NAME = value
+prefixes on a command are supported.
+There are no shell functions, loops or conditionals: use Python.
+.SS Builtins
+.BR cd ,
+.BR exit ,
+.BR quit ,
+.BR export ,
+.BR unset ,
+.BR alias ,
+.BR unalias ,
+.BR jobs ,
+.BR source ,
+.BR . ,
+.BR history ,
+.BR type ,
+.BR help .
+.SH LINE EDITING
+.TP
+.B Autosuggestion
+The most recent history entry that starts with the current line is shown in grey.
+.BR Right ,
+.B End
+or
+.B Ctrl\-F
+accept it;
+.B Alt\-F
+or
+.B Ctrl\-Right
+accept one word.
+.TP
+.B Highlighting
+Known commands are blue, unknown commands red, quoted strings yellow, operators
+cyan and existing paths underlined.
+Python lines are highlighted as Python.
+.TP
+.BR Up / Down
+Move through history entries that start with the text typed so far.
+.TP
+.B Ctrl\-R
+Open the history search menu.
+Typing filters the entries (case\-insensitive substring), Up/Down/Ctrl\-R/Tab
+move the selection,
+.B Enter
+puts the entry on the command line without running it, and
+.B Esc
+cancels.
+.TP
+.BR Tab ", " Shift\-Tab
+Complete.
+A unique match is inserted; otherwise the common prefix is inserted and a menu with
+descriptions is shown.
+Further Tab presses cycle through it,
+.B Enter
+accepts the selection without running the line, and
+.B Esc
+cancels.
+Commands are described from the man\-db index, files by type or size,
+Python attributes by type, and options by parsing
+.IB command " \-\-help"
+(only when completing a word that begins with
+.BR \- ).
+.TP
+.B Other keys
+.B Ctrl\-A
+.B Ctrl\-E
+.B Ctrl\-B
+.B Ctrl\-K
+.B Ctrl\-U
+.B Ctrl\-W
+.B Ctrl\-L
+.B Ctrl\-D
+.B Alt\-B
+.BR Alt\-D .
+.SH FILES
+.TP
+.I ~/.pyshrc.py
+Python executed in the interactive namespace at startup.
+Define
+.B prompt
+(a string or a function returning one) to change the prompt.
+.TP
+.I ~/.pysh_history
+Interactive history, one line per entry.
+.SH ENVIRONMENT
+.TP
+.B PYSH_HOME
+Python home directory (the prefix containing
+.IR lib/pythonX.Y ).
+The default is the prefix of the Python used to build pysh.
+.TP
+.B PYSH_HISTFILE
+History file.
+.TP
+.B PYTHONHOME
+Takes precedence over
+.BR PYSH_HOME .
+.SH EXIT STATUS
+The exit status of a script or
+.B \-c
+command is that of the last command run.
+Commands that cannot be found return 127.
+.SH BUILDS
+The default build links libpython into the executable and exports its symbols,
+so every Python C extension module that the system
+.B python
+can load (ssl, sqlite3, lxml, numpy, ...) also loads in pysh.
+It depends on the shared C library and a few others (libexpat, libz, libcrypto).
+.PP
+.B make static
+builds
+.BR pysh-static ,
+a fully statically linked executable with no shared library dependencies.
+It cannot load C extension modules (\fB.so\fR files).
+Modules compiled into the interpreter, such as math, socket, zlib, json and
+hashlib, are available; sqlite3, ssl, ctypes, bz2 and lzma are not.
+.SH LIMITATIONS
+There is no job control beyond
+.B &
+and
+.BR jobs .
+The line editor does not handle lines wider than the terminal.
+.SH SEE ALSO
+.BR python3 (1),
+.BR bash (1),
+.BR fish (1)

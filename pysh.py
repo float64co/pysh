@@ -13,6 +13,7 @@ class Result:
     def __init__(self, returncode=0, out=None, err=None, duration=0.0, cmd=""):
         self.returncode, self.out, self.err = returncode, out, err
         self.duration, self.cmd = duration, cmd
+        self.timed_out = False
     def __bool__(self): return self.returncode == 0
     def __str__(self): return self.out or ""
     def __repr__(self):
@@ -43,6 +44,22 @@ def match_paren(s, i):
             if depth == 0: return i + 1
         i += 1
     raise SyntaxError("unbalanced ( in command")
+
+def match_bracket(s, i):
+    """s[i] == '[' ; return the index just past the matching ']'."""
+    depth, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in "'\"":
+            j = i + 1
+            while j < n and s[j] != c: j += 2 if s[j] == "\\" and c == '"' else 1
+            i = j
+        elif c == "[": depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0: return i + 1
+        i += 1
+    raise SyntaxError("unbalanced [ in command")
 
 VARRE = re.compile(r"\$(?:\{(\w+)\}|(\w+|\?|\$))")
 
@@ -482,6 +499,10 @@ Python <-> shell:
   !(cmd)     a Result: .returncode .out .err .duration
   @(expr)    splice a Python value into a command    ls @(files)
   $VAR       environment variable; `$VAR = "x"` sets it
+  ![cmd]     a Process you read while it runs: for line in ![tail -f log]: ...
+  $[cmd]     run attached to the terminal (live, interactive programs work); returns a Result
+  sh(cmd, tee=, check=, timeout=, stream=, capture=)   the same with options
+  % cmd      a leading % forces the line to be a shell command (e.g. `% X=1; make`)
   last       the Result of the previous command
   aliases    dict: aliases['ll'] = 'ls -l', or a function(args) -> str|int
 
@@ -723,7 +744,133 @@ def _child_setup_fg():
 def _child_setup_bg():
     for s in (signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU): signal.signal(s, signal.SIG_DFL)
 
-def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdline=""):
+class _Killer:
+    """Ends a command `timeout` seconds after it started: SIGTERM, then SIGKILL two seconds later."""
+    def __init__(self, timeout, pids, pgid=None):
+        self.fired, self.pids, self.pgid, self.t2 = False, list(pids), pgid, None
+        self.t = threading.Timer(timeout, self.fire); self.t.daemon = True; self.t.start()
+    def _sig(self, s):
+        try:
+            if self.pgid: os.killpg(self.pgid, s)
+            else:
+                for pid in self.pids:
+                    try: os.kill(pid, s)
+                    except OSError: pass
+        except OSError: pass
+    def fire(self):
+        self.fired = True; self._sig(signal.SIGTERM)
+        self.t2 = threading.Timer(2.0, lambda: self._sig(signal.SIGKILL)); self.t2.daemon = True; self.t2.start()
+    def cancel(self):
+        self.t.cancel()
+        if self.t2: self.t2.cancel()
+
+def _status(rc): return rc if rc >= 0 else 128 - rc
+
+class Process:
+    """A command that is still running, read as its output arrives:
+
+        for line in ![tail -f /var/log/syslog]: ...
+        with ![make -j8] as p: ...  (terminated on leaving the block if still running)
+
+    Iterating yields lines without the newline.  .wait() returns the exit status; .result is a Result."""
+
+    def __init__(self, procs, cmd, timeout=None, preset=None, rc_override=None, check=False, pgid=None):
+        self.cmd, self.check, self._procs = cmd, check, [p for p in procs if p is not None]
+        self._last = procs[-1] if procs and procs[-1] is not None else None
+        self.pid = self._last.pid if self._last else (self._procs[-1].pid if self._procs else None)
+        self._text = (io.StringIO(preset) if preset is not None else
+                      io.TextIOWrapper(self._last.stdout, encoding="utf-8", errors="replace", newline="\n")
+                      if self._last is not None and self._last.stdout is not None else None)
+        self._rc, self._rc_override, self._t0 = None, rc_override, time.time()
+        self._killer = _Killer(timeout, [q.pid for q in self._procs], pgid) if timeout and self._procs else None
+
+    def readline(self): return self._text.readline() if self._text else ""
+    def read(self): return self._text.read() if self._text else ""
+    def __iter__(self): return self
+    def __next__(self):
+        line = self.readline()
+        if line == "":
+            self.wait(); raise StopIteration
+        return line[:-1] if line.endswith("\n") else line
+
+    def poll(self):
+        if self._rc is None:
+            if self._rc_override is not None and not self._procs: self._rc = self._rc_override
+            elif all(q.poll() is not None for q in self._procs):
+                self._rc = _status(self._last.returncode) if self._last else (self._rc_override or 127)
+        return self._rc
+
+    def wait(self, timeout=None):
+        if self._rc is None:
+            try:
+                for q in self._procs: q.wait(timeout)
+            except subprocess.TimeoutExpired: raise
+            self.poll()
+            if self._killer: self._killer.cancel()
+            if self._rc_override is not None: self._rc = self._rc_override
+        if self.check and self._rc != 0: raise ShellError(self.result)
+        return self._rc
+
+    returncode = property(poll)
+    timed_out = property(lambda self: bool(self._killer and self._killer.fired))
+    @property
+    def result(self):
+        r = Result(self._rc if self._rc is not None else self.poll(), None, None, time.time() - self._t0, self.cmd)
+        r.timed_out = self.timed_out
+        return r
+    def _signal(self, s):
+        for q in self._procs:
+            try: q.send_signal(s)
+            except OSError: pass
+    def terminate(self): self._signal(signal.SIGTERM)
+    def kill(self): self._signal(signal.SIGKILL)
+    def send_signal(self, s): self._signal(s)
+    def close(self):
+        if self._text:
+            try: self._text.close()
+            except Exception: pass
+    def __enter__(self): return self
+    def __exit__(self, *exc):
+        if self.poll() is None:
+            self.terminate()
+            try: self.wait(3)
+            except subprocess.TimeoutExpired: self.kill(); self.wait()
+        self.close(); return False
+    def __del__(self): self.close()
+    def __repr__(self):
+        st = "running" if self.poll() is None else f"exited {self._rc}"
+        return f"<Process {self.pid} {self.cmd!r} {st}>"
+
+class ShellError(Exception):
+    """Raised by sh(cmd, check=True) when the command exits non-zero."""
+    def __init__(self, result):
+        self.result, self.returncode = result, result.returncode
+        super().__init__(f"command {result.cmd!r} exited with status {result.returncode}")
+
+def _collect(p, tee):
+    """Read a process's stdout (and stderr, if piped) to the end, echoing live when `tee`."""
+    import codecs
+    bufs = {"out": [], "err": []}
+    def pump(f, name, sink):
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        while True:
+            chunk = os.read(f.fileno(), 65536)
+            if not chunk: break
+            text = dec.decode(chunk); bufs[name].append(text)
+            if sink is not None: sink.write(text); sink.flush()
+        tail = dec.decode(b"", True)
+        if tail: bufs[name].append(tail)
+    t = None
+    if p.stderr is not None:
+        t = threading.Thread(target=pump, args=(p.stderr, "err", sys.stderr if tee else None), daemon=True); t.start()
+    if p.stdout is not None: pump(p.stdout, "out", sys.stdout if tee else None)
+    if t: t.join()
+    p.wait()
+    return ("".join(bufs["out"]) if p.stdout is not None else None,
+            "".join(bufs["err"]) if p.stderr is not None else None)
+
+def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdline="", tee=False, stream=False,
+                 timeout=None, merge=False):
     sys.stdout.flush(); sys.stderr.flush()
     t0 = time.time()
     argvs = []
@@ -764,7 +911,7 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
             rc, out = run_inproc(fn, capture)
             return Result(rc, out, "", time.time() - t0, cmdline)
 
-    use_jobs = background or (INTERACTIVE and not capture and not capture_err)
+    use_jobs = background or (INTERACTIVE and not capture and not capture_err and not stream and not tee)
     procs, prev, close, pgid = [], None, [], None
     tail_rc = tail_out = None            # outcome of a final stage that ran in-process / was not found
     for n, (st, (argv, env)) in enumerate(zip(pipe, argvs)):
@@ -792,15 +939,15 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
             procs.append(None)
             if last_stage: tail_rc = rc
             continue
-        stdout = rout if rout is not None else (subprocess.PIPE if (not last_stage or capture) else None)
-        stderr = rerr if rerr is not None else (subprocess.STDOUT if st.merge_err else
-                                                subprocess.PIPE if (capture_err and last_stage) else None)
+        stdout = rout if rout is not None else (subprocess.PIPE if (not last_stage or capture or stream or tee) else None)
+        stderr = rerr if rerr is not None else (subprocess.STDOUT if (st.merge_err or (merge and last_stage)) else
+                                                subprocess.PIPE if ((capture_err or tee) and last_stage) else None)
         stdin = rin if rin is not None else prev
         if stdin is None and background and not INTERACTIVE: stdin = subprocess.DEVNULL
         kw = {}
-        if use_jobs:
+        if use_jobs or timeout:                       # a timeout needs its own process group, to kill grandchildren too
             kw["process_group"] = 0 if pgid is None else pgid
-            kw["preexec_fn"] = _child_setup_fg if (INTERACTIVE and not background) else _child_setup_bg if INTERACTIVE else None
+            if use_jobs: kw["preexec_fn"] = _child_setup_fg if (INTERACTIVE and not background) else _child_setup_bg if INTERACTIVE else None
         try:
             p = subprocess.Popen(argv, stdin=stdin, stdout=stdout, stderr=stderr,
                                  env={**os.environ, **env} if env else None, **kw)
@@ -809,7 +956,7 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
             procs.append(None); prev = None
             if last_stage: tail_rc = 127
             continue
-        if use_jobs:
+        if use_jobs or timeout:
             if pgid is None: pgid = p.pid
             try: os.setpgid(p.pid, pgid)
             except OSError: pass
@@ -819,6 +966,9 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
     for f in close: f.close()
 
     live = [p for p in procs if p is not None]
+    if stream:
+        return Process(procs, cmdline, timeout, tail_out, tail_rc, pgid=pgid)
+    killer = _Killer(timeout, [p.pid for p in live], pgid) if timeout and live else None
     if use_jobs and live:
         job = Job([p.pid for p in live], pgid, cmdline)
         for p in live: p.returncode = 0                   # we reap these ourselves; keep Popen from doing so
@@ -828,7 +978,9 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
             return Result(0, None, None, 0, cmdline)
         rc = run_foreground(job)
         if tail_rc is not None: rc = tail_rc
-        return Result(rc, tail_out, None, time.time() - t0, cmdline)
+        res = Result(rc, tail_out, None, time.time() - t0, cmdline)
+        if killer: killer.cancel(); res.timed_out = killer.fired
+        return res
     if background: return Result(0, None, None, 0, cmdline)
 
     out = err = None; rc = 127
@@ -836,17 +988,17 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
         if p is None: continue
         while True:
             try:
-                if n == len(procs) - 1 and (capture or capture_err):
-                    o, e = p.communicate()
-                    out = o.decode(errors="replace") if o is not None else None
-                    err = e.decode(errors="replace") if e is not None else None
+                if n == len(procs) - 1 and (capture or capture_err or tee):
+                    out, err = _collect(p, tee)
                 else: p.wait()
                 break
             except KeyboardInterrupt: pass
-        rc = p.returncode if p.returncode >= 0 else 128 - p.returncode
+        rc = _status(p.returncode)
     if tail_rc is not None: rc = tail_rc
     if tail_out is not None: out = tail_out
-    return Result(rc, out, err, time.time() - t0, cmdline)
+    res = Result(rc, out, err, time.time() - t0, cmdline)
+    if killer: killer.cancel(); res.timed_out = killer.fired
+    return res
 
 def run_inproc(fn, capture, stdin_text=None):
     """Run a builtin / python alias, optionally capturing its stdout and feeding it stdin."""
@@ -870,12 +1022,16 @@ def expand_alias(line):
         return line[:m.start(2)] + aliases[m.group(2)] + line[m.end(2):]
     return line
 
-def run_shell(line, capture=False, capture_err=False):
+def run_shell(line, capture=False, capture_err=False, tee=False, stream=False, timeout=None, merge=False):
     global last
+    line = line.lstrip()
+    if line.startswith("%"): line = line[1:]              # `% cmd` forces shell mode
     line, bodies, _ = split_heredocs(line)
     line = expand_alias(line)
     try: items = parse(line, bodies)
     except SyntaxError as e: sh_error(f"syntax error: {e.msg if hasattr(e,'msg') and e.msg else e}"); _setlast(Result(2, cmd=line)); return last
+    if stream and (len(items) != 1 or items[0][1] == "&"):
+        raise ValueError("![...] streams one pipeline; use sh(cmd) or a plain command for lists and background jobs")
     res, skip_until = Result(0, "" if capture else None, cmd=line), None
     for pipe, term in items:
         if skip_until == "&&" and res.returncode != 0 or skip_until == "||" and res.returncode == 0:
@@ -883,7 +1039,9 @@ def run_shell(line, capture=False, capture_err=False):
             continue
         skip_until = None
         try:
-            res = run_pipeline(pipe, capture and not term == "&", capture_err, term == "&", line)
+            res = run_pipeline(pipe, capture and not term == "&", capture_err, term == "&", line, tee, stream, timeout, merge)
+            if stream and isinstance(res, Process):
+                _setlast(Result(0, None, None, 0, line)); return res
         except SyntaxError as e: sh_error(f"syntax error: {e}"); res = Result(2, cmd=line)
         except OSError as e: sh_error(str(e)); res = Result(1, cmd=line)
         except ArithmeticError as e: sh_error(str(e)); res = Result(1, cmd=line)
@@ -910,6 +1068,9 @@ def preprocess(s):
         elif c == "$" and s[i+1:i+2] == "(":
             j = match_paren(s, i + 1); inner = s[i+2:j-1]
             out.append(f"__arith__({inner[1:-1]!r})" if is_arith(inner) else f"__sh_out__({inner!r})"); i = j
+        elif c in "!$" and s[i+1:i+2] == "[":
+            j = match_bracket(s, i + 1)
+            out.append(f"{'__stream__' if c == '!' else '__live__'}({s[i+2:j-1]!r})"); i = j
         elif c == "!" and s[i+1:i+2] == "(":
             j = match_paren(s, i + 1); out.append(f"__sh__({s[i+2:j-1]!r})"); i = j
         elif c == "$" and (m := re.match(r"\$([A-Za-z_]\w*)", s[i:])):
@@ -929,18 +1090,38 @@ def _scope():
     return getattr(_tls, "scope", None) or (ns, ns)
 
 def _scoped(fn):
-    def wrapper(c):
+    def wrapper(c, *a, **kw):
         f = sys._getframe(1)
         old = getattr(_tls, "scope", None)
         _tls.scope = (f.f_globals, f.f_locals)
-        try: return fn(c)
+        try: return fn(c, *a, **kw)
         finally: _tls.scope = old
     return wrapper
+
+def sh(cmd, capture=True, tee=False, check=False, timeout=None, stream=False, merge=False):
+    """Run a shell command from Python.
+         capture=True   collect stdout and stderr into the Result (default); False lets them reach the terminal
+         tee=True       collect them *and* show them live
+         check=True     raise ShellError if the command exits non-zero
+         timeout=N      stop the command after N seconds (SIGTERM, then SIGKILL) and raise subprocess.TimeoutExpired
+         stream=True    return a Process to read as output arrives (stderr stays on the terminal unless merge=True)
+       Equivalent syntax: !(cmd) = sh(cmd), ![cmd] = sh(cmd, stream=True), $[cmd] = sh(cmd, capture=False)."""
+    if stream:
+        proc = run_shell(cmd, stream=True, timeout=timeout, merge=merge)
+        proc.check = check
+        return proc
+    live = not capture and not tee
+    r = run_shell(cmd, capture=not live, capture_err=not live, tee=tee, timeout=timeout)
+    if r.timed_out: raise subprocess.TimeoutExpired(cmd, timeout, output=r.out, stderr=r.err)
+    if check and r.returncode != 0: raise ShellError(r)
+    return r
 
 ns.update(shell=shell, last=last, __arith__=arith, __env__=_Env(), aliases=aliases, Result=Result,
           __sh__=_scoped(lambda c: run_shell(c, capture=True, capture_err=True)),
           __sh_out__=_scoped(lambda c: capture(c).rstrip("\n")),
-          sh=_scoped(lambda c: run_shell(c, capture=True, capture_err=True)))
+          __stream__=_scoped(lambda c: sh(c, stream=True)),
+          __live__=_scoped(lambda c: sh(c, capture=False)),
+          sh=_scoped(sh), ShellError=ShellError, Process=Process)
 ns["__doc__"] = None
 ns["complete_ignore_dirs"] = ("/mnt/c",)   # PATH directories hidden from command completion
 ns["complete_ignore"] = (".dll", ".exe", ".vbs", ".efi", ".mof", ".bat", ".drv", ".sys", ".tlb", ".xml")   # command-name suffixes hidden from Tab completion (set in ~/.pyshrc.py)
@@ -952,6 +1133,7 @@ def classify(line):
     s = line.strip()
     m = re.match(r"[^\s|&;<>()=]+", s)
     w = m.group() if m else ""
+    if s.startswith("%"): return "sh"                  # `% cmd`: shell, whatever it looks like
     kw = re.match(r"[A-Za-z_]\w*", s)
     if (kw and kw.group() in KW and not (kw.group() in BUILTINS)) or s.startswith("@"): return "py"
     if w in BUILTINS and w not in ns and not s[len(w):].lstrip().startswith(("(", "=", ".", "[")): return "sh"
@@ -1023,6 +1205,8 @@ def run_script(text, filename="<pysh>"):
             else:
                 while i < len(lines):
                     if _needs_more("\n".join(buf)) or buf[-1].lstrip().startswith("@"):
+                        buf.append(lines[i]); i += 1; continue
+                    if _CONT.match(lines[i]) and re.match(r"\s*(try|if|for|while)\b", buf[0]):     # one-line `try: x` then `except:`
                         buf.append(lines[i]); i += 1; continue
                     if buf[0].rstrip().endswith(":") or len(buf) > 1:
                         j = i
@@ -1101,6 +1285,8 @@ _PYTOK = re.compile(r"""(?P<str>(?:[rbfRBF]{0,2})(?:\"\"\"[\s\S]*?(?:\"\"\"|$)|'
 C = lambda n, t: f"\x1b[{n}m{t}\x1b[0m"
 
 def highlight(buf):
+    m = re.match(r"(\s*)%", buf)
+    if m: return m.group(1) + C(90, "%") + highlight_sh(buf[m.end():])
     try: kind = classify(buf) if buf.strip() else "sh"
     except Exception: kind = "sh"
     out = []
@@ -1117,6 +1303,10 @@ def highlight(buf):
             elif k == "w" and t in ns and callable(ns[t]) or k == "w" and hasattr(builtins, t) and callable(getattr(builtins, t)): out.append(C(36, t))
             else: out.append(t)
         return "".join(out)
+    return highlight_sh(buf)
+
+def highlight_sh(buf):
+    out = []
     cmd = True
     for m in _SHTOK.finditer(buf):
         k, t = m.lastgroup, m.group()
@@ -1192,6 +1382,12 @@ def _esc(w): return re.sub(r"([ \t'\"\\$&;|<>()*?#])", r"\\\1", w)
 
 def complete(before):
     """-> (text_before_cursor_with_common_prefix, [(full_text, display, description)])"""
+    forced = re.match(r"\s*%", before)
+    if forced:                                   # `% cmd`: complete as a shell command; keep the % in the results
+        k = forced.end() - 1
+        text, items = complete(before[:k] + " " + before[k+1:])
+        fix = lambda s: s[:k] + "%" + s[k+1:]
+        return fix(text), [(fix(f), d, e) for f, d, e in items]
     m = re.search(r"[^\s|&;<>]*$", before)
     word, head = m.group(), before[:m.start()]
     stage = re.split(r"\|\||&&|[|;&]", head)[-1].split()

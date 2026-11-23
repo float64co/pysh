@@ -33,7 +33,8 @@ at build time and can be overridden with `PYSH_HOME`.
 ```
 pysh                   interactive
 pysh -c 'cmd'          run a command string and exit
-pysh script            run a file of mixed shell/Python lines
+pysh script [args]     run a file of mixed shell/Python lines (or make it executable, see Scripts)
+pysh -e ...            stop at the first failing command (scripts and -c)
 pysh --help | --version
 ```
 
@@ -47,8 +48,14 @@ pysh --help | --version
 | `!(cmd)`    | a `Result`: `.returncode .out .err .duration`               |
 | `@(expr)`   | splice a Python value into a command (lists become words)   |
 | `$VAR`      | environment variable; `$VAR = "x"` sets it                  |
+| `![cmd]`    | a `Process` you read while it runs: `for line in ![tail -f log]:` |
+| `$[cmd]`    | run attached to the terminal (live; interactive programs work), returns a `Result` |
+| `% cmd`     | a leading `%` forces shell mode: `% X=1; make`                      |
 | `last`      | the `Result` of the previous command                        |
 | `aliases`   | dict; `aliases["ll"] = "ls -l"` or a function(args)         |
+
+Inside functions, `@(expr)` sees the function's local variables. `$name` in a shell line is an
+*environment* variable; use `@(name)` for a Python variable.
 
 A line is treated as a command when it doesn't parse as Python, or when it starts with
 a name that isn't bound in Python but is a program, builtin or alias (`ls -la`, `id -u`).
@@ -58,7 +65,69 @@ The shell side has pipes (`|`, and `|&` to include stderr), `&& || ; &`, redirec
 (`{a,b}`, `{1..10..2}`, `{01..12}`), arithmetic (`$((1 + 2 * $X))`), here-documents
 (`<<EOF`, `<<-EOF`, `<<'EOF'`) and here-strings (`<<< text`). There are no shell loops or
 functions; use Python.
-Builtins: `cd exit export unset alias unalias jobs fg bg wait kill source history type help`.
+Builtins: `cd pwd exit export unset alias unalias jobs fg bg wait kill source history type help`.
+
+### Forcing shell mode with `%`
+
+pysh guesses whether a line is Python or shell. A leading `%` removes the guess: the line is a shell
+command, whatever it looks like.
+
+```
+% export X=5; sh -c 'echo $X'      # one-line assignment + command (this parses as Python otherwise)
+% echo 1 + 2                       # prints "1 + 2" instead of evaluating it
+```
+
+`%` is only special at the start of a line, so `x % 4` is still modulo. Highlighting and Tab
+completion understand it.
+
+### Streaming output
+
+`$(cmd)` and `!(cmd)` wait for the command to finish. To read output while it is still running, use
+`![cmd]`, which returns a `Process` immediately:
+
+```python
+for line in ![tail -f /var/log/syslog]:          # lines arrive as they are printed
+    if "error" in line: print(line)
+
+with ![make -j8] as p:                           # the command is ended if you leave the block early
+    for line in p:
+        print(line)
+print(p.returncode)
+```
+
+| `Process` member | |
+|---|---|
+| iteration, `readline()`, `read()` | lines without the newline / one line / everything left |
+| `wait(timeout=None)` | wait for it to exit, return the exit status |
+| `poll()`, `.returncode` | status if it has exited, else `None` |
+| `terminate()`, `kill()`, `send_signal(sig)` | signal the whole pipeline |
+| `.result` | a `Result` (after it has exited) |
+| `.pid`, `.timed_out` | |
+
+Standard error stays on the terminal (`sh(cmd, stream=True, merge=True)` folds it into the stream).
+`![...]` streams one pipeline; for `;`, `&&` or `&` lists use a normal command line.
+
+`$[cmd]` runs a command attached to the terminal: output is live, interactive programs work
+(`$[vim notes.txt]`, `Ctrl-Z` stops them) and you get a `Result` back.
+
+`sh()` is the same machinery with options, for use from Python code:
+
+```python
+sh("make", tee=True)                   # show output live and capture it in the Result
+sh("deploy.sh", check=True)            # raise ShellError (with .result) on a non-zero exit
+sh("curl -s $URL", timeout=10)         # SIGTERM after 10 s, SIGKILL 2 s later; raises subprocess.TimeoutExpired
+sh("make", capture=False)              # same as $[make]
+sh("tail -f log", stream=True)         # same as ![tail -f log]
+```
+
+`timeout` ends the whole process group, so a command that spawns children can't hold the call open.
+
+### Working directory
+
+`$PWD` always matches the real working directory: if the parent process left an unset, relative or
+stale `PWD` in the environment (for example a Windows-side path when launched through `wsl.exe`),
+pysh corrects it at startup. `cd` keeps symlinks logical like bash (`cd link; cd ..` goes to the
+link's parent; `cd -P` resolves them), and `pwd` is a builtin (`pwd -P` for the physical path).
 
 **Job control**: `Ctrl-Z` stops the foreground job, `jobs`/`fg %2`/`bg`/`kill %1`/`wait`
 manage it, `cmd &` runs in the background, finished jobs are reported before the next prompt,
@@ -112,7 +181,12 @@ complete_ignore_dirs = ("/mnt/c",)      # PATH directories hidden from completio
 def prompt(): return f"{os.getcwd()} $ "
 ```
 
-History lives in `~/.pysh_history` (`PYSH_HISTFILE` to change).
+Environment variables: `PYSH_HOME` (Python home, defaults to the build-time prefix),
+`PYSH_HISTFILE` (history file, default `~/.pysh_history`) and `PYSH_TTYLOG=file` (copy everything the
+line editor writes to the terminal into `file`, for bug reports about redraw problems).
+
+When a command's output doesn't end in a newline, the next prompt starts on a fresh row and a
+reverse-video `%` marks where the output stopped (as in zsh).
 
 ## Limitations
 

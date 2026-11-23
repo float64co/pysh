@@ -464,3 +464,127 @@ class WorkingDirectory(Base):
 
     def test_python_getcwd_follows_cd(self):
         self.assertOut("import os\ncd /usr\nprint(os.getcwd())", "/usr")
+
+
+class ForceShell(Base):
+    """A leading % makes the line a shell command, whatever it looks like as Python."""
+
+    def test_assignment_then_command_on_one_line(self):
+        self.assertOut("% export X=5; sh -c 'echo $X'", "5")
+
+    def test_python_looking_line_runs_as_shell(self):
+        self.assertOut("% echo 1 + 2", "1 + 2")                  # not evaluated as Python
+
+    def test_without_space(self):
+        self.assertOut("%echo hi", "hi")
+
+    def test_bound_name_is_still_a_command(self):
+        self.assertOut("ls = 5\n% ls -d /", "/")
+
+    def test_env_prefix_form(self):
+        self.assertOut("% FOO=bar sh -c 'echo $FOO'", "bar")
+
+    def test_in_repl_mode(self):
+        self.assertOut("% echo from-repl\n", "from-repl", mode="stdin")
+
+    def test_inside_a_python_block_line_is_not_special(self):
+        self.assertOut("x = 7\nprint(x % 4)", "3")               # modulo untouched
+
+
+class Streaming(Base):
+    def test_lines_arrive_as_they_are_produced(self):
+        r = run("import time\nt0 = time.time()\n"
+                "for line in ![sh -c 'echo a; sleep 0.6; echo b']:\n    print(line, round(time.time() - t0, 1) < 0.5)\n")
+        self.assertEqual(r.out.split("\n")[:2], ["a True", "b False"])    # 'a' was seen before the sleep ended
+
+    def test_iteration_yields_lines_without_newlines(self):
+        self.assertOut("print(list(![printf 'x\\ny\\nz\\n']))", "['x', 'y', 'z']")
+
+    def test_pipeline(self):
+        self.assertOut("print(list(![printf '1\\n2\\n3\\n' | tail -2]))", "['2', '3']")
+
+    def test_returncode_after_iteration(self):
+        self.assertOut("p = ![sh -c 'echo x; exit 3']\nlist(p)\nprint(p.returncode, p.wait())", "3 3")
+
+    def test_result_property(self):
+        self.assertOut("p = ![true]\np.wait()\nprint(p.result.returncode, bool(p.result))", "0 True")
+
+    def test_context_manager_terminates_a_running_command(self):
+        self.assertOut("import time\nwith ![sh -c 'echo first; sleep 30'] as p:\n    print(p.readline().strip())\nprint(p.poll() is not None)", "first\nTrue")
+
+    def test_readline_and_read(self):
+        self.assertOut("p = ![printf 'a\\nb\\nc\\n']\nprint(repr(p.readline()), repr(p.read()))", "'a\\n' 'b\\nc\\n'")
+
+    def test_stderr_stays_on_terminal_by_default(self):
+        r = run("print(list(![sh -c 'echo o; echo e >&2']))")
+        self.assertEqual((r.out.strip(), r.err.strip()), ("['o']", "e"))
+
+    def test_merge_stderr(self):
+        self.assertOut("print(sorted(sh(\"sh -c 'echo o; echo e >&2'\", stream=True, merge=True)))", "['e', 'o']")
+
+    def test_sees_function_locals(self):
+        self.assertOut("def f(n): return list(![seq @(n)])\nprint(f(3))", "['1', '2', '3']")
+
+    def test_kill(self):
+        self.assertOut("p = ![sleep 30]\np.kill()\nprint(p.wait())", "137")
+
+    def test_timeout_on_stream(self):
+        self.assertOut("p = sh('sleep 30', stream=True, timeout=0.3)\nprint(p.wait(), p.timed_out)", "143 True")
+
+    def test_big_output_does_not_deadlock(self):
+        self.assertOut("print(sum(1 for _ in ![seq 1 200000]))", "200000")
+
+    def test_unknown_command_streams_nothing(self):
+        r = run("print(list(![no_such_cmd_xyz]))")
+        self.assertIn("command not found", r.err)
+        self.assertIn("[]", r.out)
+
+    def test_lists_are_rejected(self):
+        r = run("![echo a; echo b]")
+        self.assertIn("one pipeline", r.err)
+
+    def test_repr(self):
+        self.assertIn("<Process", out("p = ![true]\nprint(repr(p))"))
+
+
+class ShFunction(Base):
+    def test_default_captures(self):
+        self.assertOut("r = sh(\"sh -c 'echo o; echo e >&2'\")\nprint(repr(r.out), repr(r.err))", "'o\\n' 'e\\n'")
+
+    def test_live_not_captured(self):
+        r = run("r = sh('echo shown', capture=False)\nprint(repr(r.out), r.returncode)")
+        self.assertEqual(r.out.split("\n"), ["shown", "None 0", ""])
+
+    def test_dollar_bracket_is_live(self):
+        r = run("r = $[echo live]\nprint(r.returncode, r.out)")
+        self.assertEqual(r.out.split("\n")[:2], ["live", "0 None"])
+
+    def test_tee_shows_and_captures(self):
+        r = run("r = sh(\"sh -c 'echo o; echo e >&2'\", tee=True)\nprint('got', repr(r.out), repr(r.err))")
+        self.assertEqual(r.out.split("\n")[:2], ["o", "got 'o\\n' 'e\\n'"])
+        self.assertEqual(r.err.strip(), "e")                      # stderr was shown live too
+
+    def test_check_raises(self):
+        self.assertOut("try:\n    sh('sh -c \"exit 4\"', check=True)\nexcept ShellError as e:\n    print('failed', e.returncode, e.result.cmd)", "failed 4 sh -c \"exit 4\"")
+
+    def test_check_passes_on_success(self):
+        self.assertOut("print(sh('true', check=True).returncode)", "0")
+
+    def test_timeout_raises(self):
+        self.assertOut("import subprocess\ntry:\n    sh('sleep 30', timeout=0.3)\nexcept subprocess.TimeoutExpired as e:\n    print('timed out', e.timeout)", "timed out 0.3")
+
+    def test_timeout_not_hit(self):
+        self.assertOut("print(sh('echo quick', timeout=5).out.strip())", "quick")
+
+    def test_timeout_kills_stubborn_process(self):
+        import time
+        t = time.time()
+        r = run("import subprocess\ntry:\n    sh(\"sh -c 'trap \\\"\\\" TERM; sleep 30'\", timeout=0.3)\nexcept subprocess.TimeoutExpired:\n    print('killed')")
+        self.assertEqual(r.out.strip(), "killed")
+        self.assertLess(time.time() - t, 10)                      # SIGKILL followed SIGTERM
+
+    def test_timeout_with_pipeline(self):
+        self.assertOut("import subprocess\ntry:\n    sh('sleep 30 | cat', timeout=0.3)\nexcept subprocess.TimeoutExpired:\n    print('pipeline timed out')", "pipeline timed out")
+
+    def test_scope_sees_locals(self):
+        self.assertOut("def f(n): return sh('echo @(n)').out.strip()\nprint(f(7))", "7")

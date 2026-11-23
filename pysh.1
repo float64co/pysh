@@ -143,6 +143,34 @@ In a shell command, ordinary variable expansion, including
 .B $?
 for the last return code.
 .TP
+.BI ![ cmd ]
+Start
+.I cmd
+and return a
+.B Process
+at once, to be read while it runs.
+See
+.BR STREAMING .
+.TP
+.BI $[ cmd ]
+Run
+.I cmd
+attached to the terminal (live output, interactive programs work) and return its
+.BR Result .
+.TP
+.BR sh( cmd ", ...)"
+Run a command from Python with options
+.RB ( capture ", " tee ", " check ", " timeout ", " stream ", " merge ).
+See
+.BR STREAMING .
+.TP
+.B % cmd
+A line that starts with
+.B %
+is always a shell command.
+See
+.BR "FORCING SHELL MODE" .
+.TP
 .B last
 The
 .B Result
@@ -152,6 +180,168 @@ of the most recent command.
 A dictionary of aliases.
 A string value replaces the first word of a command; a callable is called with the
 argument list and may return a string to print or an integer exit status.
+.SH FORCING SHELL MODE
+pysh decides per line whether it is Python or a shell command.
+A line that begins with
+.B %
+(after optional blanks) is always a shell command, whatever it looks like:
+.PP
+.RS
+.nf
+% export X=5; sh \-c 'echo $X'
+% echo 1 + 2
+.fi
+.RE
+.PP
+The first line sets an environment variable and runs a command in one line, which would otherwise be
+parsed as Python; the second prints
+.B 1 + 2
+instead of evaluating it.
+The
+.B %
+is removed before the line is run.
+It is only special at the start of a line, so
+.B x % 4
+is still modulo.
+Highlighting and Tab completion treat the rest of the line as a shell command.
+.SH STREAMING
+.BR $(cmd) " and " !(cmd)
+wait for the command to finish.
+.BI ![ cmd ]
+instead returns a
+.B Process
+immediately, so output can be read while the command is still running:
+.PP
+.RS
+.nf
+for line in ![tail \-f /var/log/syslog]:
+    if "error" in line: print(line)
+
+with ![make \-j8] as p:
+    for line in p:
+        print(line)
+print(p.returncode)
+.fi
+.RE
+.PP
+Only a single pipeline can be streamed; lists with
+.BR ; ,
+.B &&
+or
+.B &
+are rejected.
+Standard error stays on the terminal unless
+.B merge=True
+is given to
+.BR sh() .
+.SS Process
+.TP
+.RB "iteration, " readline() ", " read()
+Lines without the trailing newline, one line (including its newline), or everything left.
+Iteration ends when the command's output ends, and then waits for it to exit.
+.TP
+.BI wait( timeout )
+Wait for the command to exit and return its status (128+N if killed by signal N).
+Raises
+.B subprocess.TimeoutExpired
+if
+.I timeout
+passes first.
+.TP
+.BR poll() ", " returncode
+The status if the command has exited, otherwise
+.BR None .
+.TP
+.BR terminate() ", " kill() ", " send_signal( sig )
+Signal every process in the pipeline.
+.TP
+.B result
+A
+.B Result
+(without captured output) once the command has exited.
+.TP
+.BR pid ", " timed_out ", " cmd
+.TP
+.B with ![cmd] as p:
+Ends the command (SIGTERM, then SIGKILL after three seconds) if the block is left before it has exited.
+.SS $[cmd]
+Runs
+.I cmd
+in the foreground attached to the terminal: output appears immediately, interactive programs such as
+editors work, Ctrl\-Z stops them, and a
+.B Result
+is returned (its
+.B out
+and
+.B err
+are
+.BR None ).
+.SS sh()
+.B sh(cmd, capture=True, tee=False, check=False, timeout=None, stream=False, merge=False)
+.TP
+.B capture
+Collect standard output and error in the Result (default).
+.B capture=False
+is the same as
+.BR $[cmd] .
+.TP
+.B tee
+Collect them
+.I and
+show them live.
+.TP
+.B check
+Raise
+.B ShellError
+if the status is not zero.
+The exception has
+.B returncode
+and
+.B result
+attributes.
+.TP
+.B timeout
+Stop the command after this many seconds: SIGTERM to its whole process group, then SIGKILL two seconds
+later, and raise
+.BR subprocess.TimeoutExpired .
+Because the whole group is signalled, a command that has started children cannot keep the call waiting.
+.TP
+.B stream
+Return a
+.B Process
+(same as
+.BR ![cmd] ).
+.TP
+.B merge
+With
+.BR stream ,
+send standard error into the stream.
+.PP
+Inside a function,
+.BI @( expr )
+sees the function's local variables, and these calls work from threads.
+.SH WORKING DIRECTORY
+.B $PWD
+always names the real working directory.
+If the process that started pysh left an unset, relative or stale
+.B PWD
+in the environment (for example a Windows path when started through
+.BR wsl.exe ),
+pysh replaces it at startup, and child processes see the corrected value.
+.B cd
+keeps symbolic links logical, as bash does:
+.B cd link; cd ..
+goes to the directory containing the link.
+.B cd \-P
+resolves links,
+.B cd \-
+returns to
+.BR $OLDPWD ,
+and the
+.B pwd
+builtin prints the logical path
+.RB ( "pwd \-P"
+the physical one).
 .SH SHELL SYNTAX
 Pipelines (\fB|\fR, and \fB|&\fR which also pipes standard error),
 lists (\fB;\fR, \fB&&\fR, \fB||\fR), background jobs (\fB&\fR),
@@ -308,6 +498,44 @@ Python attributes by type, and options by parsing
 .B Ctrl\-D
 .B Alt\-B
 .BR Alt\-D .
+.SH CONFIGURATION
+.I ~/.pyshrc.py
+is ordinary Python run in the interactive namespace, so any of these can be set there:
+.TP
+.B aliases["name"] = "command"
+Define aliases.
+Interactive shells start with
+.B ls
+aliased to
+.B "ls \-\-color=auto"
+when the system
+.B ls
+accepts that option; replace it, or
+.B del aliases["ls"]
+to remove it.
+.TP
+.B prompt
+A string, or a function returning one.
+The default shows
+.BR user@host ,
+the working directory with parent names shortened, the git branch in white,
+and the status of the last command when it failed.
+.TP
+.B complete_ignore
+Tuple of file name suffixes never offered when completing command names
+(default: a list of Windows executable suffixes such as
+.BR .exe " and " .dll ).
+.TP
+.B complete_ignore_dirs
+Tuple of
+.B PATH
+directories skipped when completing command names (default:
+.BR /mnt/c ).
+.PP
+When a command's output does not end with a newline, the next prompt starts on a new row and a
+reverse\-video
+.B %
+shows where the output stopped.
 .SH FILES
 .TP
 .I ~/.pyshrc.py

@@ -39,6 +39,12 @@ class EditorCase(unittest.TestCase):
 
     def cursor(self): return (self.s.screen.r, self.s.screen.c)
 
+    def settle(self, expected, timeout=10.0):
+        """Wait until the edit buffer shows `expected` (typing a long line can lag behind under load)."""
+        import time
+        end = time.time() + timeout
+        while time.time() < end and self.buffer() != expected: self.s.pump(0.2, 0.5)
+
     def expect_cursor(self, n, start_row=0):
         """Cursor is where it should be after n columns of text following the prompt."""
         a = PW + n
@@ -179,8 +185,9 @@ class Wrapping(EditorCase):
 
     def test_wrapped_line_at_bottom_of_screen(self):
         for _ in range(30): self.type("echo filler" + ENTER, 0.05)
-        self.s.pump(0.3)
-        self.type("h" * 100, 1.0)
+        self.s.pump(1.0)                                   # let the shell finish the whole backlog first
+        self.type("h" * 100, 0.3)
+        self.settle("h" * 100)
         self.assertEqual(self.buffer(), "h" * 100)
         self.expect_cursor(100, start_row=self.cursor()[0] - (PW + 100) // self.cols)
 
@@ -523,6 +530,42 @@ class DefaultAliases(EditorCase):
         s2 = Session(rows=24, cols=60, home=self.s.home); self.addCleanup(s2.close)
         s2.send("alias\r", 0.5)
         self.assertIn("alias ls='ls -1'", s2.text())
+
+
+class ForceShellEditing(EditorCase):
+    def test_percent_line_runs_as_shell(self):
+        self.run_cmd("% export Q=1; sh -c 'echo q=$Q'")
+        self.assertIn("\nq=1", self.s.text())
+
+    def test_highlighting_after_percent(self):
+        self.type("% ls")
+        raw = self.s.raw.decode()
+        self.assertIn("\x1b[90m%", raw)
+        self.assertIn("\x1b[34mls", raw)                          # still judged as a command
+
+    def test_completion_after_percent_keeps_the_percent(self):
+        os.makedirs(os.path.join(self.s.home, "uniq_dir_abc"), exist_ok=True)
+        self.type("% cd uniq_d\t")
+        self.assertEqual(self.buffer(), "% cd uniq_dir_abc/")
+
+    def test_command_completion_after_percent(self):
+        self.type("% ki\t", 2.0)
+        self.assertIn("signal a process", self.s.text())
+        self.assertTrue(self.buffer().split("\n")[0].startswith("% ki"))
+
+
+class StreamingInteractive(EditorCase):
+    def test_ctrl_c_stops_a_streaming_loop_and_its_command(self):
+        self.type("for l in ![sh -c 'while true; do echo tick; sleep 0.2; done']: print(l)" + ENTER, 0.3)
+        self.type(ENTER, 1.0)
+        self.assertIn("tick", self.s.text())
+        self.type(CTRL("c"), 0.8)
+        self.assertIn("KeyboardInterrupt", self.s.text())
+        self.assertEqual(self.run_cmd("echo back").count("back"), 2)      # prompt works again (command + output)
+
+    def test_live_dollar_bracket_runs_in_foreground(self):
+        self.run_cmd("r = $[echo foreground]")
+        self.assertIn("\nforeground", self.s.text())
 
 
 class PromptCwd(EditorCase):

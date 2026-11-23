@@ -173,6 +173,11 @@ supports `--help`.
   entry owned by root and not group/world-writable. A relative path (`./tool`), a `.` or empty `$PATH` entry,
   or a program in a directory you can write to is never run. Set `probe_flags = False` in `~/.pyshrc.py` to turn
   it off.
+- **`import` searches the current directory**, as `python` does: in the REPL, `-c` and piped input the first
+  `sys.path` entry is `''` (it follows `cd`), and a script file searches its own directory. That is what lets
+  you `import` a Cython module or helper file sitting next to you, but it also means a hostile `json.py` or
+  `.so` in a directory you work in can be imported. Set `import_cwd = False` in `~/.pyshrc.py` to turn it
+  off for interactive sessions, or `PYSH_IMPORT_CWD=0` in the environment for `-c`, scripts and piped input.
 - **Completion never evaluates what you type.** Python attribute completion looks up plain dotted names only
   (no calls, no indexing, no properties).
 - **Untrusted text is neutralised.** Directory names, git branch names, history entries, `--help` output and
@@ -206,10 +211,11 @@ aliases["ll"] = "ls -l"
 complete_ignore = (".dll", ".exe")      # suffixes hidden from command completion
 complete_ignore_dirs = ("/mnt/c",)      # PATH directories hidden from completion
 probe_flags = False                    # don't run `cmd --help` for flag completion (default True)
+import_cwd = False                     # don't let `import` search the current directory (default True)
 def prompt(): return f"{os.getcwd()} $ "
 ```
 
-Environment variables: `PYSH_HOME` (Python home, defaults to the build-time prefix),
+Environment variables: `PYSH_HOME` (Python home, defaults to the build-time prefix), `PYSH_IMPORT_CWD=0` (don't search the current directory when importing),
 `PYSH_HISTFILE` (history file, default `~/.pysh_history`), `PYSH_RESIZE=reflow|redraw` (what to assume after a window resize when the terminal can't tell pysh) and `PYSH_TTYLOG=file` (copy everything the
 line editor writes to the terminal into `file`, for bug reports about redraw problems).
 

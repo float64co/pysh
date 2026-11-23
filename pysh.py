@@ -1175,6 +1175,7 @@ ns.update(shell=shell, last=last, __arith__=arith, __env__=_Env(), aliases=alias
           __live__=_scoped(lambda c: sh(c, capture=False)),
           sh=_scoped(sh), ShellError=ShellError, Process=Process)
 ns["__doc__"] = None
+ns["import_cwd"] = True                          # `import` finds modules in the current directory (or a script's own directory); False disables
 ns["probe_flags"] = True                         # Tab on a -flag runs `cmd --help` for system programs; False disables
 ns["complete_ignore_dirs"] = ("/mnt/c",)   # PATH directories hidden from command completion
 ns["complete_ignore"] = (".dll", ".exe", ".vbs", ".efi", ".mof", ".bat", ".drv", ".sys", ".tlb", ".xml")   # command-name suffixes hidden from Tab completion (set in ~/.pyshrc.py)
@@ -1354,7 +1355,7 @@ def highlight(buf):
             k, t = m.lastgroup, m.group()
             if k == "str": out.append(C(33, t))
             elif k == "cm": out.append(C(90, t))
-            elif k == "n": out.append(C(35, t))
+            elif k == "n": out.append(C(36, t))
             elif k == "w" and keyword.iskeyword(t): out.append(C(34, t))
             elif k == "w" and t in ns and callable(ns[t]) or k == "w" and hasattr(builtins, t) and callable(getattr(builtins, t)): out.append(C(36, t))
             else: out.append(t)
@@ -1597,6 +1598,7 @@ def repl():
         if os.path.exists(rcf):
             try: exec(compile(open(rcf).read(), rcf, "exec"), ns)
             except Exception: traceback.print_exc()
+        drop_import_cwd()
     internal_errors = 0
     while True:
         try: line = read_entry(tty)
@@ -1621,6 +1623,17 @@ def repl():
     if tty: print()
     hup_jobs()
     return last.returncode
+
+def setup_import_path(first):
+    """Like python: the REPL, -c and piped input search the current directory ('' follows `cd`); a script file
+    searches its own directory. PYSH_IMPORT_CWD=0 turns it off here; `import_cwd = False` in ~/.pyshrc.py does too."""
+    if os.environ.get("PYSH_IMPORT_CWD", "1") in ("0", "false", "no", ""): return
+    if first not in sys.path: sys.path.insert(0, first)
+
+def drop_import_cwd():
+    """After ~/.pyshrc.py: honour `import_cwd = False` by removing the current directory from the search path."""
+    if not ns.get("import_cwd", True):
+        while "" in sys.path: sys.path.remove("")
 
 def exit_status(e):
     """Exit status for a SystemExit, as Python does: None is 0, an int is itself, anything else is printed to stderr and is 1."""
@@ -1649,12 +1662,14 @@ def main(argv):
     if args and args[0] == "-c":
         if len(args) < 2: sh_error("-c needs an argument"); return 2
         sys.argv, _batch = ["pysh"] + args[2:], True
+        setup_import_path("")
         try: run_script(args[1])
         except SystemExit as e: return exit_status(e)
         return last.returncode
     if args:
         path = args[0]
         sys.argv, _batch = args, True
+        setup_import_path(os.path.dirname(os.path.realpath(path)))
         try:
             with open(path) as f: text = f.read()
         except OSError as e: sh_error(f"{path}: {e.strerror}"); return 127
@@ -1662,6 +1677,7 @@ def main(argv):
         try: run_script(text, path)
         except SystemExit as e: return exit_status(e)
         return last.returncode
+    setup_import_path("")
     return repl()
 
 if __name__ == "__main__":

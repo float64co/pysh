@@ -485,6 +485,12 @@ class Highlighting(EditorCase):
         self.type(CTRL("u") + "ls")
         self.assertIn("\x1b[34mls", self.s.raw.decode())
 
+    def test_numbers_match_the_prompts_directory_colour(self):
+        self.type("len([1])+50")
+        raw = self.s.raw.decode()
+        self.assertIn("\x1b[36m50", raw)                         # same colour as the cwd in the prompt (\x1b[36m)
+        self.assertNotIn("\x1b[35m", raw)
+
     def test_strings_yellow_operators_cyan(self):
         self.type("echo 'a b' | cat")
         raw = self.s.raw.decode()
@@ -538,6 +544,27 @@ class DefaultAliases(EditorCase):
         s2 = Session(rows=24, cols=60, home=self.s.home); self.addCleanup(s2.close)
         s2.send("alias\r", 0.5)
         self.assertIn("alias ls='ls -1'", s2.text())
+
+
+class ImportCwdSetting(unittest.TestCase):
+    """`import_cwd` in ~/.pyshrc.py controls whether the current directory is searched by `import`."""
+    def session(self, rc):
+        home = tempfile.mkdtemp(prefix="pysh-test-")
+        with open(os.path.join(home, "mymod.py"), "w") as f: f.write("x = 42\n")
+        if rc is not None:
+            with open(os.path.join(home, ".pyshrc.py"), "w") as f: f.write(rc)
+        s = Session(rows=24, cols=80, home=home); self.addCleanup(s.close)
+        return s
+
+    def test_default_imports_from_the_cwd(self):
+        s = self.session(None)
+        s.send("import mymod\r", 0.6); s.send("print(mymod.x + 1)\r", 0.6)
+        self.assertIn("\n43", s.text())
+
+    def test_can_be_turned_off_in_the_rc_file(self):
+        s = self.session("import_cwd = False\n")
+        s.send("import mymod\r", 0.6)
+        self.assertIn("No module named 'mymod'", s.text())
 
 
 class ForceShellEditing(EditorCase):

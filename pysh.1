@@ -534,6 +534,27 @@ Tuple of file name suffixes never offered when completing command names
 (default: a list of Windows executable suffixes such as
 .BR .exe " and " .dll ).
 .TP
+.B import_cwd
+When
+.B True
+(the default),
+.B import
+searches the current directory, as
+.B python
+does: the first
+.I sys.path
+entry is the empty string in the REPL,
+.B \-c
+and piped input (it follows
+.BR cd ),
+and a script file searches its own directory.
+This lets you import a Cython module or helper file next to you, but a hostile module in a directory you work in can then be imported.
+Set to
+.B False
+in
+.I ~/.pyshrc.py
+to disable it for interactive sessions.
+.TP
 .B probe_flags
 Tab on a word starting with
 .B \-
@@ -598,6 +619,17 @@ Define
 .I ~/.pysh_history
 Interactive history, one line per entry.
 .SH ENVIRONMENT
+.TP
+.B PYSH_IMPORT_CWD
+Set to
+.B 0
+to stop
+.B import
+searching the current directory (or a script's directory) in
+.BR \-c ,
+script and piped-input runs, where
+.I ~/.pyshrc.py
+is not read.
 .TP
 .B PYSH_HOME
 Python home directory (the prefix containing

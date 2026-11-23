@@ -612,3 +612,39 @@ class ExitMessages(Base):
     def test_stdout_is_flushed_before_the_message(self):
         r = run('import sys\nprint("first")\nsys.exit("second")\n')
         self.assertEqual(r.out, "first\n"); self.assertEqual(r.err.strip(), "second")
+
+
+class ImportFromCwd(Base):
+    """Modules next to you can be imported, as with `python`; the `import_cwd` switches turn that off."""
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.d, ignore_errors=True))
+        os.makedirs(os.path.join(self.d, "sub"))
+        for name, text in {"mymod.py": "x = 42\n", "sub/sib.py": "y = 7\n", "sub/uses_sib.py": "import sib\nprint('sibling', sib.y)\n",
+                           "sub/uses_cwd.py": "import mymod\nprint('cwd module', mymod.x)\n"}.items():
+            with open(os.path.join(self.d, name), "w") as f: f.write(text)
+
+    def test_dash_c_and_stdin_search_the_cwd(self):
+        self.assertEqual(run("import mymod\nprint(mymod.x)\n", mode="c", cwd=self.d).out.strip(), "42")
+        self.assertEqual(run("import mymod\nprint(mymod.x)\n", mode="stdin", cwd=self.d).out.strip(), "42")
+
+    def test_cwd_entry_follows_cd(self):
+        r = run("import os\nos.chdir('sub')\nimport sib\nprint(sib.y)\n", mode="stdin", cwd=self.d)
+        self.assertEqual(r.out.strip(), "7", msg=repr(r))
+
+    def test_script_searches_its_own_directory_not_the_cwd(self):
+        sub = os.path.join(self.d, "sub")
+        import subprocess
+        from helpers import PYSH
+        ok = subprocess.run([PYSH, os.path.join(sub, "uses_sib.py")], capture_output=True, text=True, cwd=self.d)
+        self.assertEqual(ok.stdout.strip(), "sibling 7", msg=ok.stderr)
+        bad = subprocess.run([PYSH, os.path.join(sub, "uses_cwd.py")], capture_output=True, text=True, cwd=self.d)
+        self.assertIn("No module named 'mymod'", bad.stderr)
+        self.assertEqual(bad.returncode, 1)
+
+    def test_environment_switch(self):
+        r = run("import mymod\n", mode="c", cwd=self.d, env={"PYSH_IMPORT_CWD": "0"})
+        self.assertEqual(r.rc, 1); self.assertIn("No module named 'mymod'", r.err)
+
+    def test_import_cwd_is_a_documented_setting(self):
+        self.assertEqual(run("print(import_cwd)\n", mode="stdin").out.strip(), "True")

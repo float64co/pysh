@@ -150,6 +150,11 @@ prints a traceback with the real file and line and exits 1; a failing command do
 script unless you use `#!/usr/bin/pysh -e` (or `pysh -e script`). A Python block ends at the first
 unindented line, so shell lines can follow it directly.
 
+`sys.exit(3)` sets the exit status; `sys.exit("message")` prints the message to standard error and exits 1,
+as in Python. Fourteen complete, tested scripts are in [`examples/`](examples/) (disk usage, TLS expiry
+checks, flaky-test detection, import graphs, a local-LLM commit-message drafter, and more); each
+supports `--help`.
+
 ## Interactive features
 
 - **Autosuggestions**: grey text from history. `→`/`End`/`Ctrl-F` accept, `Alt-F` takes a word.

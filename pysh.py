@@ -1614,13 +1614,23 @@ def repl():
         if tty: save_history(line)
         _exit_warned = False if not line.strip().startswith(("exit", "quit")) else _exit_warned
         try: run_line(line)
-        except SystemExit as e: hup_jobs(); return int(e.code or 0) if not isinstance(e.code, str) else 1
+        except SystemExit as e: hup_jobs(); return exit_status(e)
         except KeyboardInterrupt: print()
         except Exception as e:
             sh_error(f"internal error: {type(e).__name__}: {e}"); _setlast(Result(70, cmd=line))
     if tty: print()
     hup_jobs()
     return last.returncode
+
+def exit_status(e):
+    """Exit status for a SystemExit, as Python does: None is 0, an int is itself, anything else is printed to stderr and is 1."""
+    c = e.code
+    if c is None: return 0
+    if isinstance(c, int): return c
+    try: sys.stdout.flush()
+    except Exception: pass
+    print(c, file=sys.stderr)
+    return 1
 
 def main(argv):
     global _batch, _errexit
@@ -1640,7 +1650,7 @@ def main(argv):
         if len(args) < 2: sh_error("-c needs an argument"); return 2
         sys.argv, _batch = ["pysh"] + args[2:], True
         try: run_script(args[1])
-        except SystemExit as e: return int(e.code or 0)
+        except SystemExit as e: return exit_status(e)
         return last.returncode
     if args:
         path = args[0]
@@ -1650,7 +1660,7 @@ def main(argv):
         except OSError as e: sh_error(f"{path}: {e.strerror}"); return 127
         ns["__file__"] = os.path.abspath(path)
         try: run_script(text, path)
-        except SystemExit as e: return int(e.code or 0) if not isinstance(e.code, str) else 1
+        except SystemExit as e: return exit_status(e)
         return last.returncode
     return repl()
 

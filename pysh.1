@@ -101,11 +101,19 @@ A name that is not a command reports
 .IP \(bu 3
 The exit status is that of the last command, or the argument of
 .BR exit .
+.B sys.exit(\fIn\fR)
+sets it too, and
+.B sys.exit("message")
+prints the message to standard error and exits with status 1, as in Python.
 .IP \(bu 3
 .B $name
 in a shell line is an environment variable; use
 .BI @( name )
 for a Python variable.
+.PP
+Complete example scripts are in the
+.B examples/
+directory of the source tree.
 .SH PYTHON AND SHELL TOGETHER
 .TP
 .BI $( cmd )

@@ -588,3 +588,27 @@ class ShFunction(Base):
 
     def test_scope_sees_locals(self):
         self.assertOut("def f(n): return sh('echo @(n)').out.strip()\nprint(f(7))", "7")
+
+
+class ExitMessages(Base):
+    """sys.exit("text") prints the text to stderr and exits 1, like Python."""
+    def test_string_exit_in_a_script_file(self):
+        r = run('import sys\nsys.exit("boom: it broke")\n')
+        self.assertEqual((r.rc, r.err.strip()), (1, "boom: it broke"), msg=repr(r))
+
+    def test_string_exit_with_c(self):
+        r = run('import sys; sys.exit("via -c")', mode="c")
+        self.assertEqual((r.rc, r.err.strip()), (1, "via -c"), msg=repr(r))
+
+    def test_string_exit_from_piped_input(self):
+        r = run('import sys\nsys.exit("via stdin")\n', mode="stdin")
+        self.assertEqual((r.rc, r.err.strip()), (1, "via stdin"), msg=repr(r))
+
+    def test_numeric_and_none_exit(self):
+        self.assertEqual(run("import sys\nsys.exit(3)\n").rc, 3)
+        self.assertEqual(run("import sys\nsys.exit()\n").rc, 0)
+        self.assertEqual(run("import sys\nsys.exit(None)\n").rc, 0)
+
+    def test_stdout_is_flushed_before_the_message(self):
+        r = run('import sys\nprint("first")\nsys.exit("second")\n')
+        self.assertEqual(r.out, "first\n"); self.assertEqual(r.err.strip(), "second")

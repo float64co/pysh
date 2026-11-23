@@ -384,13 +384,38 @@ _errexit = False       # pysh -e: a failing command ends the run
 
 def sh_error(msg): sys.stderr.write(f"pysh: {_where}{msg}\n"); sys.stderr.flush()
 
+def _same_dir(a, b):
+    try: return os.path.samefile(a, b)
+    except OSError: return False
+
+def logical_cwd():
+    """$PWD if it really names the current directory (symlinks kept), else the physical path."""
+    cwd, pwd = os.getcwd(), os.environ.get("PWD")
+    return pwd if pwd and os.path.isabs(pwd) and _same_dir(pwd, cwd) else cwd
+
+def fix_pwd():
+    """Make $PWD agree with the real working directory.  A shell launched from elsewhere (wsl.exe from a
+    Windows directory, su, sudo, a terminal that sets PWD itself) can inherit a stale or foreign PWD."""
+    os.environ["PWD"] = logical_cwd()
+
 def b_cd(a):
+    physical = bool(a) and a[0] == "-P"
+    if a and a[0] in ("-L", "-P"): a = a[1:]
     d = a[0] if a else os.path.expanduser("~")
     if d == "-": d = os.environ.get("OLDPWD", ".")
-    old = os.getcwd()
-    try: os.chdir(d)
-    except OSError as e: sh_error(f"cd: {d}: {e.strerror}"); return 1
-    os.environ["OLDPWD"], os.environ["PWD"] = old, os.getcwd()
+    old = logical_cwd()
+    target = os.path.normpath(os.path.join(old, d)) if not physical else d    # ".." is resolved logically, as in bash
+    try: os.chdir(target)
+    except OSError:
+        try: os.chdir(d)
+        except OSError as e: sh_error(f"cd: {d}: {e.strerror}"); return 1
+        target = d
+    os.environ["OLDPWD"] = old
+    new = os.getcwd()
+    os.environ["PWD"] = target if (not physical and os.path.isabs(target) and _same_dir(target, new)) else new
+    return 0
+def b_pwd(a):
+    print(os.getcwd() if a and a[0] == "-P" else logical_cwd())
     return 0
 def b_exit(a):
     global _exit_warned
@@ -489,7 +514,7 @@ def b_help(a):
     print(HELP.replace("{builtins}", " ".join(sorted(BUILTINS))))
     return 0
 
-BUILTINS = {"cd": b_cd, "exit": b_exit, "quit": b_exit, "export": b_export, "unset": b_unset,
+BUILTINS = {"cd": b_cd, "pwd": b_pwd, "exit": b_exit, "quit": b_exit, "export": b_export, "unset": b_unset,
             "alias": b_alias, "unalias": b_unalias, "source": b_source,
             ".": b_source, "history": b_history, "type": b_type, "help": b_help}
 
@@ -715,13 +740,26 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
     if len(pipe) == 1 and not argvs[0][0]:           # bare VAR=val
         os.environ.update(argvs[0][1]); return Result(0, "", "", 0, cmdline)
 
-    def inproc_fn(argv):
-        if argv[0] in BUILTINS: return lambda: BUILTINS[argv[0]](argv[1:])
-        f = aliases.get(argv[0])
-        return (lambda: f(argv[1:])) if callable(f) else None
+    def inproc_fn(argv, env=None):
+        if argv[0] in BUILTINS: fn = lambda: BUILTINS[argv[0]](argv[1:])
+        else:
+            f = aliases.get(argv[0])
+            if not callable(f): return None
+            fn = lambda: f(argv[1:])
+        if not env: return fn
+        def with_env():                                   # FOO=x builtin: visible only while it runs
+            saved = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
+            try: return fn()
+            finally:
+                for k, v in saved.items():
+                    if os.environ.get(k) != env[k]: continue      # the builtin changed it itself; keep that
+                    if v is None: os.environ.pop(k, None)
+                    else: os.environ[k] = v
+        return with_env
 
     if len(pipe) == 1 and not pipe[0].redirs and not background:
-        fn = inproc_fn(argvs[0][0])
+        fn = inproc_fn(*argvs[0])
         if fn:
             rc, out = run_inproc(fn, capture)
             return Result(rc, out, "", time.time() - t0, cmdline)
@@ -737,7 +775,7 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
         except OSError as e:
             for f in close: f.close()
             sh_error(f"{e.filename}: {e.strerror}"); return Result(1, "", "", 0, cmdline)
-        fn = inproc_fn(argv) if (len(pipe) > 1 or st.redirs) else None
+        fn = inproc_fn(argv, env) if (len(pipe) > 1 or st.redirs) else None
         if fn:                                            # builtin / python alias as a pipeline stage
             src = rin if rin is not None else prev
             text = src.read().decode(errors="replace") if src is not None else None
@@ -827,9 +865,9 @@ def run_inproc(fn, capture, stdin_text=None):
     return (r if isinstance(r, int) else 0), (buf.getvalue() if capture else None)
 
 def expand_alias(line):
-    m = re.match(r"\s*([^\s|&;<>]+)", line)
-    if m and isinstance(aliases.get(m.group(1)), str):
-        return line[:m.start(1)] + aliases[m.group(1)] + line[m.end(1):]
+    m = re.match(r"\s*((?:[A-Za-z_]\w*=(?:\"[^\"]*\"|'[^']*'|[^\s|&;<>])*\s+)*)([^\s|&;<>]+)", line)   # skip leading FOO=bar words
+    if m and isinstance(aliases.get(m.group(2)), str):
+        return line[:m.start(2)] + aliases[m.group(2)] + line[m.end(2):]
     return line
 
 def run_shell(line, capture=False, capture_err=False):
@@ -1036,7 +1074,7 @@ def git_branch():
 
 def prompt():
     _cmdcache.clear()
-    cwd = os.getcwd(); home = os.path.expanduser("~")
+    cwd = logical_cwd(); home = os.path.expanduser("~")
     if cwd == home or cwd.startswith(home + "/"): cwd = "~" + cwd[len(home):]
     parts = cwd.split("/")                      # fish-style prompt_pwd: shorten parents
     short = "/".join([p[:1] if p and p != "~" else p for p in parts[:-1]] + parts[-1:])
@@ -1138,7 +1176,7 @@ BUILTIN_DOC = {"cd": "change directory", "exit": "leave the shell", "quit": "lea
                "export": "set environment variables", "unset": "remove environment variables",
                "alias": "define or list aliases", "unalias": "remove aliases", "jobs": "list background jobs",
                "source": "run a script in this shell", ".": "run a script in this shell",
-               "history": "show command history", "fg": "resume a job in the foreground", "bg": "resume a job in the background",
+               "history": "show command history", "pwd": "print the working directory", "fg": "resume a job in the foreground", "bg": "resume a job in the background",
                "wait": "wait for background jobs", "kill": "signal a process or %job", "type": "describe how a name resolves", "help": "pysh help"}
 
 def _pydoc(o):
@@ -1300,6 +1338,7 @@ def repl():
 
 def main(argv):
     global _batch, _errexit
+    fix_pwd()
     args, i = list(argv[1:]), 0
     while i < len(args) and args[i].startswith("-") and args[i] not in ("-",):
         a = args[i]

@@ -144,6 +144,10 @@ class Expansion(Base):
     def test_env_prefix(self):
         self.assertOut("FOO=bar sh -c 'echo $FOO'", "bar")
 
+    def test_env_prefix_builtin_and_alias(self):
+        self.assertOut("FOO=bar export X=$FOO\nsh -c 'echo $X'", "")
+        self.assertOut("alias e='sh -c \"echo \\$FOO\"'\nFOO=bar e\nsh -c 'echo [$FOO]'", "bar\n[]")
+
     def test_export_and_unset(self):
         self.assertOut("export A=1\nsh -c 'echo [$A]'\nunset A\nsh -c 'echo [$A]'", "[1]\n[]")
 
@@ -406,3 +410,57 @@ class ShebangScripts(Base):
         p = self.script("import sys\nprint(sys.argv[1:])")
         r = subprocess.run([PYSH, "--", p, "-e"], capture_output=True, text=True)
         self.assertEqual(r.stdout.strip(), "['-e']")
+
+
+class WorkingDirectory(Base):
+    """$PWD must describe the real current directory, whatever the parent process left in the environment."""
+
+    def test_stale_inherited_pwd_is_corrected(self):
+        d = tempfile.mkdtemp()
+        r = run("echo $PWD\nimport os\nprint(os.getcwd())", cwd=d, env={"PWD": "/mnt/c/Users/somebody"})
+        real = os.path.realpath(d)
+        self.assertEqual(r.out.split("\n")[:2], [real, real])
+
+    def test_unset_pwd_is_set(self):
+        d = tempfile.mkdtemp()
+        e = {k: v for k, v in os.environ.items() if k != "PWD"}
+        import subprocess
+        from helpers import PYSH
+        r = subprocess.run([PYSH, "-c", "echo [$PWD]"], cwd=d, env=e, capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), f"[{os.path.realpath(d)}]")
+
+    def test_relative_pwd_is_replaced(self):
+        d = tempfile.mkdtemp()
+        self.assertEqual(out("echo $PWD", cwd=d, env={"PWD": "."}), os.path.realpath(d))
+
+    def test_valid_symlink_pwd_is_kept(self):
+        d = tempfile.mkdtemp(); os.mkdir(os.path.join(d, "real")); os.symlink("real", os.path.join(d, "link"))
+        link = os.path.join(d, "link")
+        self.assertEqual(out("echo $PWD", cwd=link, env={"PWD": link}), link)
+
+    def test_cd_updates_pwd_and_children_see_it(self):
+        self.assertOut("cd /usr\necho $PWD\nsh -c 'echo $PWD'\ncd lib\necho $PWD\ncd ..\necho $PWD", "/usr\n/usr\n/usr/lib\n/usr")
+
+    def test_cd_keeps_symlinks_logical(self):
+        d = tempfile.mkdtemp(); os.mkdir(os.path.join(d, "real")); os.symlink("real", os.path.join(d, "link"))
+        link = os.path.join(d, "link")
+        self.assertOut(f"cd {link}\necho $PWD\npwd\npwd -P\ncd ..\necho $PWD",
+                       f"{link}\n{link}\n{os.path.realpath(link)}\n{d}")
+
+    def test_cd_dash_returns(self):
+        self.assertOut("cd /usr\ncd /tmp\ncd -\necho $PWD\necho $OLDPWD", "/usr\n/tmp")
+
+    def test_cd_failure_leaves_pwd(self):
+        r = run("cd /usr\ncd /nonexistent_dir_xyz\necho $PWD")
+        self.assertEqual(r.out.strip(), "/usr")
+        self.assertIn("No such file", r.err)
+
+    def test_cd_physical_flag(self):
+        d = tempfile.mkdtemp(); os.mkdir(os.path.join(d, "real")); os.symlink("real", os.path.join(d, "link"))
+        self.assertOut(f"cd -P {d}/link\necho $PWD", os.path.join(os.path.realpath(d), "real"))
+
+    def test_pwd_builtin_not_the_binary(self):
+        self.assertIn("builtin", out("type pwd"))
+
+    def test_python_getcwd_follows_cd(self):
+        self.assertOut("import os\ncd /usr\nprint(os.getcwd())", "/usr")

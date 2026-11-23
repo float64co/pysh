@@ -525,6 +525,13 @@ class DefaultAliases(EditorCase):
         self.assertIn("alias ls='ls -1'", s2.text())
 
 
+class PromptCwd(EditorCase):
+    def test_prompt_uses_real_directory_despite_stale_pwd(self):
+        s = Session(rows=24, cols=60, env={"PWD": "/mnt/c/Users/elsewhere"}); self.addCleanup(s.close)
+        self.assertIn("~>", s.text())                                  # home, not the stale Windows-side path
+        self.assertNotIn("mnt", s.text())
+
+
 class PromptSpace(EditorCase):
     def test_output_without_newline_is_not_overwritten_by_prompt(self):
         self.run_cmd("printf partial")

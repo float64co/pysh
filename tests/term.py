@@ -73,6 +73,14 @@ class Screen:
             elif n[0] == 2: self.grid[self.r] = [" "] * self.cols
         if cmd in "ABCDH": self.pending = False   # explicit cursor motion cancels the pending wrap
 
+    def resize(self, rows, cols):
+        """Like xterm: no reflow; rows are cut or padded and the cursor stays where it was (clamped)."""
+        grid = [[" "] * cols for _ in range(rows)]
+        for r in range(min(rows, self.rows)):
+            for c in range(min(cols, self.cols)): grid[r][c] = self.grid[r][c]
+        self.grid, self.rows, self.cols = grid, rows, cols
+        self.r, self.c, self.pending = min(self.r, rows - 1), min(self.c, cols - 1), False
+
     def lines(self):
         return ["".join(row).rstrip() for row in self.grid]
 
@@ -85,7 +93,8 @@ class Screen:
 class Session:
     """pysh running on a pty, with its output fed into a Screen."""
 
-    def __init__(self, args=(), rows=24, cols=80, home=None, history=None, env=None, binary=None):
+    def __init__(self, args=(), rows=24, cols=80, home=None, history=None, env=None, binary=None, answer_dsr=True):
+        self.answer_dsr = answer_dsr
         self.home = home or tempfile.mkdtemp(prefix="pysh-test-")
         if history is not None:
             with open(os.path.join(self.home, ".pysh_history"), "w") as f: f.write("".join(h + "\n" for h in history))
@@ -112,6 +121,8 @@ class Session:
             if not d: break
             self.raw += d
             self.screen.feed(d.decode("utf-8", "replace"))
+            if self.answer_dsr and d.endswith(b"\x1b[6n"):            # cursor position report
+                os.write(self.fd, f"\x1b[{self.screen.r + 1};{self.screen.c + 1}R".encode())
 
     def send(self, data, quiet=0.25):
         if isinstance(data, str): data = data.encode()
@@ -127,6 +138,12 @@ class Session:
         return text in self.screen.text()
 
     def text(self): return self.screen.text()
+
+    def resize(self, rows, cols, quiet=0.5):
+        """Resize the pty (the kernel sends SIGWINCH to pysh) and the emulated screen."""
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        self.screen.resize(rows, cols)
+        self.pump(quiet)
 
     def close(self):
         try: os.close(self.fd)

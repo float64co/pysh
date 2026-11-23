@@ -156,6 +156,7 @@ unindented line, so shell lines can follow it directly.
 - **Highlighting**: valid commands blue, unknown red, strings yellow, paths underlined.
 - **Tab completion menu** with descriptions: commands from man pages, files by type/size,
   Python attributes by type, flags parsed from `cmd --help`. Tab cycles, Enter runs the selection, Esc cancels.
+- **Pasting**: text that arrives in one go (a paste, or typing ahead while a command runs) is inserted in one step and repainted once, so large pastes are fast.
 - **`Ctrl-R`** history search menu; `↑`/`↓` search history by prefix.
 - **Colored `ls`**: interactive shells alias `ls` to `ls --color=auto` when your `ls` supports it (override in `~/.pyshrc.py`).
 - **Prompt**: `user@host ~/s/c/pysh(branch)>`, with the git branch in white.
@@ -182,7 +183,7 @@ def prompt(): return f"{os.getcwd()} $ "
 ```
 
 Environment variables: `PYSH_HOME` (Python home, defaults to the build-time prefix),
-`PYSH_HISTFILE` (history file, default `~/.pysh_history`) and `PYSH_TTYLOG=file` (copy everything the
+`PYSH_HISTFILE` (history file, default `~/.pysh_history`), `PYSH_RESIZE=reflow|redraw` (what to assume after a window resize when the terminal can't tell pysh) and `PYSH_TTYLOG=file` (copy everything the
 line editor writes to the terminal into `file`, for bug reports about redraw problems).
 
 When a command's output doesn't end in a newline, the next prompt starts on a fresh row and a
@@ -192,7 +193,8 @@ reverse-video `%` marks where the output stopped (as in zsh).
 
 - Job control needs Python 3.11+ (`process_group`) and a controlling terminal.
 - `make static` cannot import C-extension modules.
-- The line editor assumes the terminal doesn't resize while you're typing a line.
+- A line being edited can be up to 256 KiB; beyond that the terminal beeps and ignores more input.
+- Resizing the window while you type repaints the line in place, once per resize (a drag is coalesced). pysh asks the terminal where the cursor is to tell whether it re-wrapped the old text or left it alone, so it works the same in reflowing terminals (Windows Terminal, VTE, kitty, iTerm2, tmux) and non-reflowing ones (xterm). Only if the terminal doesn't answer, or the answer makes no sense, does it start a fresh prompt below. When part of a long line has already scrolled into the history, that fragment stays there.
 
 ## Examples
 

@@ -39,6 +39,12 @@ class EditorCase(unittest.TestCase):
 
     def cursor(self): return (self.s.screen.r, self.s.screen.c)
 
+    def settle_cursor(self, n, timeout=10.0):
+        import time
+        a = PW + n
+        end = time.time() + timeout
+        while time.time() < end and self.cursor() != (a // self.cols, a % self.cols): self.s.pump(0.1, 0.4)
+
     def settle(self, expected, timeout=10.0):
         """Wait until the edit buffer shows `expected` (typing a long line can lag behind under load)."""
         import time
@@ -146,14 +152,16 @@ class Wrapping(EditorCase):
         for n in range(59, 0, -1):
             self.type("\x7f", 0.05)
             if n in (self.cols - PW, self.cols - PW + 1, self.cols - PW - 1, 30):
+                self.settle("a" * n)                      # keys queue up faster than each repaint
                 self.assertEqual(self.buffer(), "a" * n)
                 self.expect_cursor(n)
-        self.s.pump(0.2)
+        self.settle("a")
         self.assertEqual(self.buffer(), "a")
 
     def test_left_arrow_across_rows(self):
         self.type("b" * 70)
         for n in range(70, 0, -1):
+            self.settle_cursor(n)
             self.expect_cursor(n)
             self.type(LEFT, 0.04)
         self.expect_cursor(0)
@@ -566,6 +574,145 @@ class StreamingInteractive(EditorCase):
     def test_live_dollar_bracket_runs_in_foreground(self):
         self.run_cmd("r = $[echo foreground]")
         self.assertIn("\nforeground", self.s.text())
+
+
+class LongLines(EditorCase):
+    cols, rows = 80, 24
+
+    def test_line_longer_than_the_old_8k_limit(self):
+        text = "x" * 20000
+        self.s.send("printf %s " + text + " | wc -c" + ENTER, 3.0)
+        self.s.wait_for("20000", 20)
+        self.assertIn("20000", self.s.text().split("\n")[-2] + self.s.text().split("\n")[-1])
+
+    def test_pasted_text_is_inserted_in_one_go(self):
+        import time
+        t0 = time.time()
+        self.s.send("a" * 5000, 1.0)
+        self.assertLess(time.time() - t0, 15)
+        self.s.send(CTRL("a") + CTRL("k"))                             # editing still works on a long line
+        self.assertEqual(self.buffer(), "")
+
+    def test_pasted_text_with_utf8_and_a_control_key(self):
+        self.s.send("héllo wörld 漢字" + CTRL("a") + "X", 1.0)
+        self.assertEqual(self.buffer(), "Xhéllo wörld 漢字")
+
+
+class Resize(EditorCase):
+    """The terminal is resized while a line is being edited (the emulator behaves like xterm: no reflow)."""
+    cols, rows = 60, 20
+
+    def prompts(self, s):
+        return [i for i, l in enumerate(s.screen.lines()) if l.startswith("tester@")]
+
+    def logical_line(self, s, start):
+        return "".join(s.screen.lines()[start:]).strip()
+
+    def new_session(self, **kw):
+        s = Session(rows=20, cols=60, **kw); self.addCleanup(s.close)
+        return s
+
+    def test_shrinking_repaints_in_place(self):
+        s = self.new_session()
+        s.send("echo " + "w" * 70, 0.4)
+        s.resize(20, 40)
+        self.assertEqual(len(self.prompts(s)), 1)                       # no extra prompt line
+        start = self.prompts(s)[0]
+        self.assertIn("echo " + "w" * 70, self.logical_line(s, start))
+        a = PW + 5 + 70
+        self.assertEqual((s.screen.r, s.screen.c), (start + a // 40, a % 40))
+        s.send("Z", 0.4)                                                # editing carries on
+        self.assertIn("w" * 10 + "Z", self.logical_line(s, start))
+
+    def test_widening_repaints_in_place(self):
+        s = self.new_session()
+        s.send("echo " + "v" * 70, 0.4)
+        s.resize(20, 100)
+        self.assertEqual(len(self.prompts(s)), 1)
+        start = self.prompts(s)[0]
+        self.assertIn("echo " + "v" * 70, self.logical_line(s, start))
+        a = PW + 5 + 70
+        self.assertEqual((s.screen.r, s.screen.c), (start + a // 100, a % 100))
+
+    def test_dragging_does_not_pile_up_prompts(self):
+        s = self.new_session()
+        s.send("t", 0.4)
+        for width in range(60, 30, -1):                                 # a drag: many events, no pause
+            fcntl_resize(s, 20, width)
+        s.pump(0.8)
+        s.screen.resize(20, 30)
+        for width in range(30, 70, 2):
+            s.resize(20, width, quiet=0.15)
+        self.assertEqual(len(self.prompts(s)), 1, s.text())
+        self.assertTrue(s.text().rstrip().endswith("t"))
+
+    def test_cursor_in_the_middle_of_a_wrapped_line(self):
+        s = self.new_session()
+        s.send("echo " + "m" * 70 + CTRL("a") + RIGHT * 10, 0.5)
+        s.resize(20, 40)
+        start = self.prompts(s)[0]
+        a = PW + 10
+        self.assertEqual((s.screen.r, s.screen.c), (start + a // 40, a % 40))
+
+    def test_resize_while_a_menu_is_open(self):
+        s = self.new_session()
+        for n in ("fa1.txt", "fb2.txt"):
+            with open(os.path.join(s.home, n), "w") as f: f.write("x")
+        s.send("cat f\t", 0.5)
+        s.resize(20, 30)
+        self.assertIn("fa1.txt", s.text()); self.assertIn("fb2.txt", s.text())
+        s.send("\x1b", 0.5)
+        lines = s.screen.lines()
+        last_prompt = max(self.prompts(s))
+        self.assertEqual([l for l in lines[last_prompt + 1:] if l.strip()], [])     # menu gone below the prompt
+
+    def test_resize_outside_editing_is_harmless(self):
+        self.run_cmd("echo before")
+        self.s.resize(20, 40)
+        self.assertIn("\nafter", self.run_cmd("echo after"))
+
+    def test_terminal_that_cannot_answer_falls_back_to_a_fresh_prompt(self):
+        s = self.new_session(answer_dsr=False, env={"PYSH_RESIZE": "redraw"})
+        s.send("echo hello", 0.4)
+        s.resize(20, 40, quiet=0.8)
+        self.assertEqual(len(self.prompts(s)), 2)                        # old one stays; new one below it
+        self.assertIn("echo hello", self.logical_line(s, self.prompts(s)[-1]))
+
+    @unittest.skipUnless(__import__("shutil").which("tmux"), "needs tmux (a real terminal that reflows)")
+    def test_reflowing_terminal_real_tmux(self):
+        import subprocess, tempfile, time
+        home = tempfile.mkdtemp(); sock = f"pyshtest{os.getpid()}"
+        from term import PYSH
+        def tmux(*a): return subprocess.run(["tmux", "-L", sock, *a], capture_output=True, text=True).stdout
+        self.addCleanup(lambda: tmux("kill-server"))
+        tmux("new-session", "-d", "-x", "70", "-y", "20", "-c", home, f"env HOME={home} USER=tester {PYSH}")
+        for _ in range(60):
+            if "tester@" in tmux("capture-pane", "-p"): break
+            time.sleep(0.1)
+        text = "echo " + "r" * 80
+        tmux("send-keys", "-l", text); time.sleep(1.0)
+        for w in (65, 60, 55, 50, 45): tmux("resize-window", "-x", str(w), "-y", "20")      # a quick drag
+        time.sleep(1.2)
+        logical = [l for l in tmux("capture-pane", "-p", "-J").split("\n") if l.strip()]
+        self.assertEqual(len([l for l in logical if l.startswith("tester@")]), 1, logical)     # no duplicated prompt
+        self.assertTrue(logical[-1].endswith(text), logical)
+        cx, cy = map(int, tmux("display-message", "-p", "#{cursor_x} #{cursor_y}").split())
+        rows = tmux("capture-pane", "-p").split("\n")
+        start = max(i for i, l in enumerate(rows) if l.startswith("tester@"))
+        a = PW + len(text)
+        self.assertEqual((cx, cy), (a % 45, start + a // 45))                                   # cursor follows the reflow
+        for w in (60, 80): tmux("resize-window", "-x", str(w), "-y", "20")                     # and back out again
+        time.sleep(1.0)
+        logical = [l for l in tmux("capture-pane", "-p", "-J").split("\n") if l.strip()]
+        self.assertEqual(len([l for l in logical if l.startswith("tester@")]), 1, logical)
+        tmux("send-keys", "Z"); time.sleep(0.5)
+        self.assertTrue(tmux("capture-pane", "-p", "-J").rstrip().endswith(text + "Z"))
+
+
+def fcntl_resize(session, rows, cols):
+    """Resize the pty without waiting for the program (one event of a drag)."""
+    import fcntl, struct, termios
+    fcntl.ioctl(session.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
 class PromptCwd(EditorCase):

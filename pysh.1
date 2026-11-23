@@ -553,6 +553,16 @@ Python home directory (the prefix containing
 .IR lib/pythonX.Y ).
 The default is the prefix of the Python used to build pysh.
 .TP
+.B PYSH_RESIZE
+After a window resize while a line is being edited, pysh asks the terminal where the cursor is to find out
+whether the old text was re\-wrapped or left alone, and repaints the line in place.
+If the terminal does not answer, or the answer is ambiguous, this variable decides:
+.B reflow
+(the terminal re\-wraps existing text; the default for Windows Terminal, VTE, kitty, iTerm2, WezTerm and tmux)
+or
+.B redraw
+(draw a fresh prompt below the old text).
+.TP
 .B PYSH_HISTFILE
 History file.
 .TP
@@ -583,6 +593,7 @@ It cannot load C extension modules (\fB.so\fR files).
 Modules compiled into the interpreter, such as math, socket, zlib, json and
 hashlib, are available; sqlite3, ssl, ctypes, bz2 and lzma are not.
 .SH LIMITATIONS
+A line being edited can hold up to 256 KiB; past that the terminal beeps and further input is ignored.
 Shell variables other than environment variables do not exist: use Python variables.
 There are no subshells, functions, loops or conditionals in the shell syntax.
 Job control needs Python 3.11 or later.

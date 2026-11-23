@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <locale.h>
 #include <poll.h>
+#include <signal.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
@@ -22,19 +23,28 @@
 
 /* ---------------------------------------------------------------- editor */
 
-#define MAXLINE 8192
+#define MAXLINE (256 * 1024)
 
+static volatile sig_atomic_t g_winch;     /* set by SIGWINCH while a line is being edited */
+static void on_winch(int sig) { (void)sig; g_winch = 1; }
+static int pushback = -1;                 /* a key read ahead while coalescing typed/pasted text */
+
+/* Next byte of input.  Returns -1 on timeout, -2 on EOF/error, and -3 (blocking reads only) when the
+ * terminal was resized, so the editor can repaint. */
 static int key(int timeout_ms) {
     unsigned char c;
+    if (pushback >= 0) { c = (unsigned char)pushback; pushback = -1; return c; }
     if (timeout_ms >= 0) {
         struct pollfd p = {0, POLLIN, 0};
         if (poll(&p, 1, timeout_ms) <= 0) return -1;
     }
     for (;;) {
+        if (g_winch && timeout_ms < 0) return -3;               /* a resize arrived while we weren't reading */
         ssize_t n = read(0, &c, 1);
         if (n == 1) return c;
         if (n == 0) return -2;
-        if (errno != EINTR) return -2;
+        if (errno == EINTR) { if (g_winch && timeout_ms < 0) return -3; continue; }
+        return -2;
     }
 }
 
@@ -92,6 +102,7 @@ static PyObject *g_suggest, *g_highlight, *g_search;
 static int m_active, m_search;
 static char g_sug[MAXLINE];   /* current suggestion tail (only when cursor at end) */
 static int g_row;             /* cursor row relative to the first row of the prompt */
+static int g_w = 80;          /* terminal width at the last repaint */
 static int g_below;           /* rows of menu currently drawn below the line */
 
 /* ------------------------------------------------------ completion menu */
@@ -190,6 +201,7 @@ static void menu_close(void) {
 static void redraw(const char *prompt, int pw, const char *buf, int len, int pos) {
     int W, H;
     term_size(&W, &H);
+    g_w = W;
     g_sug[0] = 0;
     if (pos == len && len > 0 && g_suggest != Py_None && !m_active) {
         PyObject *r = PyObject_CallFunction(g_suggest, "s#", buf, (Py_ssize_t)len);
@@ -226,7 +238,7 @@ static void redraw(const char *prompt, int pw, const char *buf, int len, int pos
 }
 
 static void ins(char *buf, int *len, int *pos, const char *s, int n) {
-    if (*len + n >= MAXLINE) return;
+    if (*len + n >= MAXLINE) { outs("\a"); return; }           /* line full: beep instead of silently dropping */
     memmove(buf + *pos + n, buf + *pos, *len - *pos);
     memcpy(buf + *pos, s, n);
     *len += n; *pos += n;
@@ -245,6 +257,56 @@ static int word_fwd(const char *b, int len, int p) {
     while (p < len && b[p] == ' ') p++;
     while (p < len && b[p] != ' ') p++;
     return p;
+}
+
+/* insert the character whose first byte is c (reading the rest of a UTF-8 sequence) */
+static void ins_key(char *buf, int *len, int *pos, int c) {
+    char ch[4]; int n = 1; ch[0] = (char)c;
+    if (c >= 0xC0) {
+        int more = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1;
+        for (int i = 0; i < more; i++) { int x = key(-1); if (x < 0) break; ch[n++] = (char)x; }
+    }
+    ins(buf, len, pos, ch, n);
+}
+
+/* Ask the terminal where the cursor is (1-based).  Returns 0 if it doesn't answer within 200 ms. */
+static int cursor_pos(int *row, int *col) {
+    char b[48]; int n = 0;
+    pushback = -1;
+    outs("\x1b[6n");
+    for (;;) {
+        int c = key(200);
+        if (c < 0) return 0;
+        if (n < (int)sizeof b - 1) b[n++] = (char)c;
+        if (c == 'R') break;
+    }
+    b[n] = 0;
+    char *p = strstr(b, "\x1b[");
+    return p && sscanf(p + 2, "%d;%d", row, col) == 2;
+}
+
+/* Cursor position and the terminal's real width (it can differ from the pty's size for a moment while a
+ * multiplexer or window is still being resized).  The cursor is put back where it was.  Returns 1 only if the
+ * cursor reads the same before and after the width probe, i.e. the terminal was not changing underneath us. */
+static int probe_terminal(int *row, int *col, int *width) {
+    int r2 = 0, c2 = 0, r3 = 0, c3 = 0;
+    if (!cursor_pos(row, col)) return -1;
+    outs("\x1b[999C");
+    *width = cursor_pos(&r2, &c2) ? c2 : 0;
+    outs("\r");
+    if (*col > 1) outf("\x1b[%dC", *col - 1);
+    if (!cursor_pos(&r3, &c3)) return -1;
+    return r3 == *row && c3 == *col;
+}
+
+/* Terminals that reflow wrapped lines when resized: the old text is re-laid out at the new width, so we
+ * only need the cursor's new row.  Others keep the old rows, so start a fresh prompt below them.
+ * PYSH_RESIZE=reflow|redraw overrides the guess. */
+static int terminal_reflows(void) {
+    const char *e = getenv("PYSH_RESIZE");
+    if (e) return strcmp(e, "reflow") == 0;
+    return getenv("WT_SESSION") || getenv("VTE_VERSION") || getenv("KITTY_WINDOW_ID") || getenv("ITERM_SESSION_ID") ||
+           getenv("WEZTERM_PANE") || getenv("TMUX");
 }
 
 /* Ctrl-R: re-run the history query for what's in the buffer */
@@ -269,6 +331,11 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
     raw.c_iflag &= ~(IXON | ICRNL | INLCR);
     raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
     tcsetattr(0, TCSADRAIN, &raw);
+    struct sigaction sa, old_sa;
+    memset(&sa, 0, sizeof sa); sa.sa_handler = on_winch; sigemptyset(&sa.sa_mask);   /* no SA_RESTART: read() must wake */
+    sigaction(SIGWINCH, &sa, &old_sa);
+    g_winch = 0; pushback = -1;
+    int reflow = terminal_reflows();
 
     static char buf[MAXLINE], saved[MAXLINE];
     int len = 0, pos = 0;
@@ -279,7 +346,7 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
     buf[0] = 0;
     m_active = m_search = 0; Py_CLEAR(m_items); g_row = 0; g_below = 0;
     if (g_log < 0 && getenv("PYSH_TTYLOG")) g_log = open(getenv("PYSH_TTYLOG"), O_WRONLY | O_CREAT | O_APPEND, 0600);
-    if (g_log >= 0) { int w, h; char t[64]; term_size(&w, &h); snprintf(t, sizeof t, "\n<<readline %dx%d>>\n", w, h); out(t, strlen(t)); }
+    if (g_log >= 0) { int w, h; char t[64]; term_size(&w, &h); int n = snprintf(t, sizeof t, "\n<<readline %dx%d>>\n", w, h); ssize_t r = write(g_log, t, n); (void)r; }
     {   /* zsh-style "prompt space": if the previous output left the cursor mid-line, mark it with a
          * reverse-video % and start the prompt on a fresh row; at column 0 this is invisible */
         int w, h; term_size(&w, &h);
@@ -292,6 +359,35 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
 #define REDRAW() redraw(prompt, pw, buf, len, pos)
     for (;;) {
         int c = key(-1);
+        if (c == -3) {                                     /* the terminal was resized */
+            int W, H, row = 0, col = 0, tw = 0, have, oldW = g_w, mode;       /* mode: 0 reflowed, 1 unchanged, 2 unknown */
+            for (int tries = 0;; tries++) {
+                do { g_winch = 0; poll(NULL, 0, 80); } while (g_winch);       /* a drag sends a burst: let it settle */
+                term_size(&W, &H);
+                have = probe_terminal(&row, &col, &tw);
+                if (have == 0 && tries < 8) continue;                         /* still changing: look again */
+                if (have == 1 && tw && tw != W && tries < 8) continue;        /* terminal and pty disagree: the pty will catch up */
+                break;
+            }
+            int tc = pw + text_width(buf, pos), new_row = tc / W;
+            if (have == 1) {
+                int ok_new = (col - 1 == tc % W);                            /* where the cursor would be if the text was re-wrapped */
+                int ok_old = (col - 1 == tc % oldW) && row - g_row >= 1;     /* ... or if nothing moved */
+                mode = ok_new && ok_old ? (reflow ? 0 : 1) : ok_new ? 0 : ok_old ? 1 : 2;
+            } else mode = reflow ? 0 : 2;                                           /* no (reliable) answer: use the hint */
+            if (g_log >= 0) { char t[160]; int n = snprintf(t, sizeof t, "\n<<resize %d -> %d cursor=%d;%d tc=%d g_row=%d mode=%d>>\n", oldW, W, row, col, tc, g_row, mode); ssize_t r = write(g_log, t, n); (void)r; }
+            g_below = 0;
+            if (mode == 0 && new_row > row - 1) {
+                /* The top of the line has scrolled into the history.  Wipe the visible remainder and start below
+                 * a blank row, so the history's wrapped fragment can't be joined to the new prompt on a later resize. */
+                if (row > 1) outf("\x1b[%dA", row - 1);
+                outs("\r\x1b[J\r\n");
+                g_row = 0;
+            } else if (mode == 0) g_row = new_row;
+            else if (mode == 2) { outs("\r\n"); g_row = 0; }
+            REDRAW();
+            continue;
+        }
         if (c == -2) { PyErr_SetString(PyExc_EOFError, "eof"); break; }
         int changed = 1, refresh = 1;
         if (m_active && m_search && (c == '\r' || c == '\n')) {      /* take the chosen history entry */
@@ -410,9 +506,13 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
         }
         default:
             if (c >= 32 || c < 0) {
-                char ch[4]; int n = 1; ch[0] = (char)c;
-                if (c >= 0xC0) { int more = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1; for (int i = 0; i < more; i++) { int x = key(-1); if (x < 0) break; ch[n++] = (char)x; } }
-                ins(buf, &len, &pos, ch, n);
+                ins_key(buf, &len, &pos, c);
+                for (;;) {                                  /* pasted/typed-ahead text: insert it all, repaint once */
+                    int x = key(0);
+                    if (x < 0) break;
+                    if (x < 32 || x == 127 || x == 0x1b) { pushback = x; break; }
+                    ins_key(buf, &len, &pos, x);
+                }
             } else changed = 0;
         }
         goto redraw_now;
@@ -448,6 +548,7 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
         }
     }
 done:
+    sigaction(SIGWINCH, &old_sa, NULL);
     m_active = m_search = 0; Py_CLEAR(m_items);
     tcsetattr(0, TCSADRAIN, &old);
     return result;

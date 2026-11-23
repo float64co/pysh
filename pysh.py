@@ -1,5 +1,5 @@
 # pysh -- embedded shell logic.  Executed by pysh.c inside __main__.
-import ast, builtins, codeop, glob, io, keyword, operator, os, re, shutil, signal, subprocess, sys, tempfile, time, traceback
+import ast, builtins, codeop, glob, io, keyword, operator, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, traceback
 
 VERSION = "0.1"
 shell = sys.modules["__main__"]                # pysh's own internals: shell.jobs, shell.history, ...
@@ -286,7 +286,7 @@ def _expand_word(segs):
             put(ws[0], True)
             for w in ws[1:]: fields.append([(w, True)])
         elif kind == "py":
-            v = eval(text, ns)
+            v = eval(text, *_scope())
             vs = list(v) if isinstance(v, (list, tuple, set)) else [v]
             for j, x in enumerate(vs):
                 if j or not fields[-1]: pass
@@ -378,7 +378,11 @@ def is_command(w):
     if r is None: r = _cmdcache[w] = shutil.which(w) is not None
     return r
 
-def sh_error(msg): sys.stderr.write(f"pysh: {msg}\n"); sys.stderr.flush()
+_where = ""            # "script.psh:12: " while running a script file, for error messages
+_batch = False         # running a script / -c: an uncaught Python exception ends the run (interactive: it doesn't)
+_errexit = False       # pysh -e: a failing command ends the run
+
+def sh_error(msg): sys.stderr.write(f"pysh: {_where}{msg}\n"); sys.stderr.flush()
 
 def b_cd(a):
     d = a[0] if a else os.path.expanduser("~")
@@ -430,7 +434,7 @@ def b_type(a):
         else: sh_error(f"type: {w}: not found"); rc = 1
     return rc
 USAGE = """\
-Usage: pysh [-c COMMAND [ARG...]] [SCRIPT [ARG...]]
+Usage: pysh [-e] [-c COMMAND [ARG...]] [SCRIPT [ARG...]]
        pysh [-h | --help | -V | --version]"""
 
 HELP = USAGE + """
@@ -441,9 +445,12 @@ shell command otherwise.
 
 Options:
   -c COMMAND     run COMMAND, then exit
+  -e             stop at the first command that fails (scripts and -c)
   -h, --help     show this help and exit
   -V, --version  show version information and exit
-  SCRIPT         run a file of mixed shell/Python lines
+  SCRIPT         run a file of mixed shell/Python lines; start it with `#!/usr/bin/pysh`
+                 (or `#!/usr/bin/env pysh`) and `chmod +x` to run it directly.  An uncaught
+                 Python exception ends the script with status 1.
 
 Python <-> shell:
   $(cmd)     stdout of cmd, as a str          x = $(date +%Y)
@@ -843,6 +850,7 @@ def run_shell(line, capture=False, capture_err=False):
         except OSError as e: sh_error(str(e)); res = Result(1, cmd=line)
         except ArithmeticError as e: sh_error(str(e)); res = Result(1, cmd=line)
         _setlast(res)
+        if _errexit and res.returncode != 0 and term not in ("&&", "||", "&"): raise SystemExit(res.returncode)
         if term in ("&&", "||"): skip_until = term
     return res
 
@@ -876,9 +884,25 @@ class _Env:
     def __setitem__(s, k, v): os.environ[k] = str(v)
     def __contains__(s, k): return k in os.environ
 
-ns.update(shell=shell, last=last, __arith__=arith, __sh__=lambda c: run_shell(c, capture=True, capture_err=True),
-          __sh_out__=lambda c: capture(c).rstrip("\n"), __env__=_Env(),
-          aliases=aliases, Result=Result, sh=lambda c: run_shell(c, capture=True, capture_err=True))
+_tls = threading.local()
+
+def _scope():
+    """(globals, locals) that @(expr) is evaluated in: the Python frame that ran the command."""
+    return getattr(_tls, "scope", None) or (ns, ns)
+
+def _scoped(fn):
+    def wrapper(c):
+        f = sys._getframe(1)
+        old = getattr(_tls, "scope", None)
+        _tls.scope = (f.f_globals, f.f_locals)
+        try: return fn(c)
+        finally: _tls.scope = old
+    return wrapper
+
+ns.update(shell=shell, last=last, __arith__=arith, __env__=_Env(), aliases=aliases, Result=Result,
+          __sh__=_scoped(lambda c: run_shell(c, capture=True, capture_err=True)),
+          __sh_out__=_scoped(lambda c: capture(c).rstrip("\n")),
+          sh=_scoped(lambda c: run_shell(c, capture=True, capture_err=True)))
 ns["__doc__"] = None
 ns["complete_ignore_dirs"] = ("/mnt/c",)   # PATH directories hidden from command completion
 ns["complete_ignore"] = (".dll", ".exe", ".vbs", ".efi", ".mof", ".bat", ".drv", ".sys", ".tlb", ".xml")   # command-name suffixes hidden from Tab completion (set in ~/.pyshrc.py)
@@ -890,12 +914,14 @@ def classify(line):
     s = line.strip()
     m = re.match(r"[^\s|&;<>()=]+", s)
     w = m.group() if m else ""
-    if w in KW or s.startswith("@"): return "py"
+    kw = re.match(r"[A-Za-z_]\w*", s)
+    if (kw and kw.group() in KW and not (kw.group() in BUILTINS)) or s.startswith("@"): return "py"
     if w in BUILTINS and w not in ns and not s[len(w):].lstrip().startswith(("(", "=", ".", "[")): return "sh"
     py = preprocess(s)
     try: code = codeop.compile_command(py, "<pysh>", "single")
     except (SyntaxError, ValueError, OverflowError): return "sh"
-    if code is None: return "sh"
+    if code is None:                                  # unfinished: an open bracket/string, or a block header
+        return "sh" if (w and w not in ns and is_command(w)) else "py"
     try: tree = ast.parse(py)
     except SyntaxError: return "sh"
     if tree.body and all(isinstance(x, ast.Expr) for x in tree.body) and w:
@@ -931,31 +957,63 @@ def run_line(line):
     if classify(line.split("\n", 1)[0]) == "sh": return run_shell(line)
     return run_python(line)
 
-def run_script(text):
-    buf = []
-    for ln in text.splitlines():
-        if not buf and (not ln.strip() or ln.lstrip().startswith("#")): continue
-        buf.append(ln)
-        src = "\n".join(buf)
-        if src.endswith("\\"): buf[-1] = ln[:-1]; continue
-        if classify(buf[0]) == "sh" and not split_heredocs(src)[2]: continue      # still inside a here-document
-        if classify(buf[0]) == "py":
-            try: done = codeop.compile_command(preprocess(src), "<pysh>", "exec") is not None
-            except SyntaxError: done = True
-            if not done or (len(buf) > 1 and ln.strip()) or (len(buf) > 1 and ln[:1] in " \t"):
-                continue
-        run_py_or_sh("\n".join(buf)); buf = []
-    if buf: run_py_or_sh("\n".join(buf))
+_CONT = re.compile(r"\s*(else|elif|except|finally)\b")
 
-def run_py_or_sh(src):
+def _needs_more(src):
+    """True if `src` is an unfinished Python statement (open bracket, string, or block header)."""
+    try: compile(preprocess(src) + "\n", "<pysh>", "exec"); return False
+    except SyntaxError as e:
+        return any(x in str(e.msg) for x in ("never closed", "unterminated triple", "expected an indented block", "unexpected EOF"))
+    except (ValueError, OverflowError): return False
+
+def run_script(text, filename="<pysh>"):
+    """Run a file of mixed shell/Python lines.  A Python block ends at the first line that isn't indented
+    (or a blank line followed by one); shell lines run one at a time (with here-document bodies)."""
+    global _where
+    lines, i = text.splitlines(), 0
+    if lines and lines[0].startswith("#!"): lines[0] = ""                      # keep numbering, drop the shebang
+    isfile = not filename.startswith("<")
+    try:
+        while i < len(lines):
+            ln = lines[i]; start = i + 1; i += 1
+            if not ln.strip() or ln.lstrip().startswith("#"): continue
+            buf = [ln]
+            if isfile: _where = f"{os.path.basename(filename)}:{start}: "
+            if classify(ln) == "sh":
+                while buf[-1].endswith("\\") and i < len(lines): buf[-1] = buf[-1][:-1] + lines[i]; i += 1
+                while not split_heredocs("\n".join(buf))[2] and i < len(lines): buf.append(lines[i]); i += 1
+            else:
+                while i < len(lines):
+                    if _needs_more("\n".join(buf)) or buf[-1].lstrip().startswith("@"):
+                        buf.append(lines[i]); i += 1; continue
+                    if buf[0].rstrip().endswith(":") or len(buf) > 1:
+                        j = i
+                        while j < len(lines) and not lines[j].strip(): j += 1
+                        if j < len(lines) and (lines[j][:1] in (" ", "\t") or _CONT.match(lines[j])):
+                            buf.extend(lines[i:j+1]); i = j + 1; continue
+                    break
+            run_py_or_sh("\n".join(buf), filename, start)
+    finally:
+        _where = ""
+
+def run_py_or_sh(src, filename="<pysh>", lineno=1):
     first = src.split("\n", 1)[0]
     if classify(first) == "sh" and ("\n" not in src or heredoc_markers(first)): return run_shell(src)
     src = src if src.endswith("\n") else src + "\n"
     try:
-        exec(compile(preprocess(src), "<pysh>", "exec"), ns)
+        exec(compile("\n" * (lineno - 1) + preprocess(src), filename, "exec"), ns)    # padding keeps real line numbers
     except SystemExit: raise
+    except NameError as e:
+        word = src.strip()
+        if re.fullmatch(r"[\w.+-]+", word) and e.name == word:                  # a lone unknown word is a missing command
+            sh_error(f"{word}: command not found"); _setlast(Result(127, cmd=word))
+            if _errexit: raise SystemExit(127)
+            return
+        traceback.print_exception(type(e), e, e.__traceback__.tb_next)
+        if _batch: raise SystemExit(1)
     except BaseException as e:
         traceback.print_exception(type(e), e, e.__traceback__.tb_next if not isinstance(e, SyntaxError) else None)
+        if _batch: raise SystemExit(1)
 
 # --------------------------------------------------------------- interface
 def git_branch():
@@ -1241,21 +1299,33 @@ def repl():
     return last.returncode
 
 def main(argv):
-    if len(argv) >= 3 and argv[1] == "-c":
-        sys.argv = ["pysh"] + argv[3:]
-        try: run_script(argv[2])
+    global _batch, _errexit
+    args, i = list(argv[1:]), 0
+    while i < len(args) and args[i].startswith("-") and args[i] not in ("-",):
+        a = args[i]
+        if a == "--": i += 1; break
+        if a in ("-V", "--version"):
+            print(f"pysh {VERSION}\nPython {sys.version}\nhome {sys.prefix}"); return 0
+        if a in ("-h", "--help"): print(HELP.replace("{builtins}", " ".join(sorted(BUILTINS)))); return 0
+        if a == "-e": _errexit = True; i += 1; continue
+        if a == "-c": break
+        sh_error(f"unknown option {a}"); print(USAGE, file=sys.stderr); return 2
+    args = args[i:]
+    if args and args[0] == "-c":
+        if len(args) < 2: sh_error("-c needs an argument"); return 2
+        sys.argv, _batch = ["pysh"] + args[2:], True
+        try: run_script(args[1])
         except SystemExit as e: return int(e.code or 0)
         return last.returncode
-    if len(argv) >= 2 and argv[1] in ("-V", "--version"):
-        print(f"pysh {VERSION}\nPython {sys.version}\nhome {sys.prefix}"); return 0
-    if len(argv) >= 2 and argv[1] in ("-h", "--help"): print(HELP.replace("{builtins}", " ".join(sorted(BUILTINS)))); return 0
-    if len(argv) >= 2 and argv[1].startswith("-") and argv[1] != "-":
-        sh_error(f"unknown option {argv[1]}"); print(USAGE, file=sys.stderr); return 2
-    if len(argv) >= 2:
-        sys.argv = argv[1:]
-        try: run_script(open(argv[1]).read())
-        except SystemExit as e: return int(e.code or 0)
-        except OSError as e: sh_error(f"{argv[1]}: {e.strerror}"); return 127
+    if args:
+        path = args[0]
+        sys.argv, _batch = args, True
+        try:
+            with open(path) as f: text = f.read()
+        except OSError as e: sh_error(f"{path}: {e.strerror}"); return 127
+        ns["__file__"] = os.path.abspath(path)
+        try: run_script(text, path)
+        except SystemExit as e: return int(e.code or 0) if not isinstance(e.code, str) else 1
         return last.returncode
     return repl()
 

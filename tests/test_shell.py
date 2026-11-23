@@ -249,3 +249,160 @@ class Cli(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScriptBlocks(Base):
+    """Block structure in script files / -c: where a Python block ends and shell lines resume."""
+
+    def test_shell_line_after_block_is_a_command(self):
+        self.assertOut("for i in range(2):\n    print(i)\n\necho shell-after", "0\n1\nshell-after")
+
+    def test_shell_line_right_after_block_without_blank(self):
+        self.assertOut("for i in range(2):\n    print(i)\necho shell-after", "0\n1\nshell-after")
+
+    def test_blank_lines_inside_a_block(self):
+        self.assertOut("def f():\n    a = 1\n\n    return a\n\nprint(f())", "1")
+
+    def test_try_except_finally(self):
+        self.assertOut("try:\n    1/0\nexcept ZeroDivisionError:\n    print('caught')\nfinally:\n    print('fin')\necho after", "caught\nfin\nafter")
+
+    def test_if_else_chain(self):
+        self.assertOut("x = 2\nif x == 1:\n    print('one')\nelif x == 2:\n    print('two')\nelse:\n    print('other')\necho done", "two\ndone")
+
+    def test_decorator(self):
+        self.assertOut("def deco(f):\n    return lambda: 'wrapped ' + f()\n@deco\ndef g():\n    return 'g'\nprint(g())", "wrapped g")
+
+    def test_multiline_brackets_and_strings(self):
+        self.assertOut("xs = [1,\n      2,\n      3]\ns = '''a\nb'''\nprint(len(xs), s.splitlines())", "3 ['a', 'b']")
+
+    def test_backslash_continuation_in_shell_line(self):
+        self.assertOut("echo one \\\n two", "one two")
+
+    def test_python_then_shell_then_python(self):
+        self.assertOut("x = $(echo 5)\nls -d / > /dev/null\nprint(int(x) + 1)", "6")
+
+    def test_class_definition(self):
+        self.assertOut("class A:\n    def hi(self):\n        return 'hi'\n\nprint(A().hi())\necho end", "hi\nend")
+
+    def test_heredoc_inside_script_between_blocks(self):
+        self.assertOut("for i in range(1):\n    print('p')\ncat <<EOF\nbody\nEOF\nprint('q')", "p\nbody\nq")
+
+    def test_uncaught_exception_ends_a_script(self):
+        r = run("raise ValueError('boom')\necho not-reached")
+        self.assertIn("boom", r.err)
+        self.assertNotIn("not-reached", r.out)
+        self.assertEqual(r.rc, 1)
+
+    def test_caught_exception_continues(self):
+        self.assertOut("try:\n    raise ValueError('x')\nexcept ValueError:\n    print('handled')\necho after", "handled\nafter")
+
+    def test_failed_command_does_not_end_a_script(self):
+        self.assertOut("false\necho still", "still")
+
+
+class SpliceScope(Base):
+    def test_splice_sees_function_locals(self):
+        self.assertOut("def f(n):\n    return $(echo @(n * 2))\nprint(f(21))", "42")
+
+    def test_bang_paren_in_function_with_locals(self):
+        self.assertOut("def f(n):\n    return !(sh -c @(f'exit {n}')).returncode\nprint(f(3))", "3")
+
+    def test_splice_in_comprehension_and_threads(self):
+        self.assertOut("import concurrent.futures as cf\ndef p(n): return $(echo @(n))\nwith cf.ThreadPoolExecutor(3) as ex: print(sorted(ex.map(p, range(5))))",
+                       "['0', '1', '2', '3', '4']")
+
+
+class ShebangScripts(Base):
+    """Executable files that start with #!/path/to/pysh."""
+
+    @staticmethod
+    def script(body, shebang=None, name="s"):
+        import stat, tempfile
+        from helpers import PYSH
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, name)
+        with open(path, "w") as f: f.write((shebang or f"#!{PYSH}") + "\n" + body)
+        os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
+        return path
+
+    @staticmethod
+    def execute(path, *args, **kw):
+        import subprocess
+        return subprocess.run([path, *args], capture_output=True, text=True, timeout=30, **kw)
+
+    def test_runs_directly(self):
+        r = self.execute(self.script("echo hi\nprint(6 * 7)"))
+        self.assertEqual(r.stdout, "hi\n42\n")
+
+    def test_arguments_and_file(self):
+        p = self.script("import sys\nprint(sys.argv[1:], __file__ == sys.argv[0])")
+        self.assertEqual(self.execute(p, "a", "b c").stdout.strip(), "['a', 'b c'] True")
+
+    def test_exit_status(self):
+        self.assertEqual(self.execute(self.script("exit 7")).returncode, 7)
+        self.assertEqual(self.execute(self.script("echo ok")).returncode, 0)
+        self.assertEqual(self.execute(self.script("false")).returncode, 1)
+
+    def test_env_shebang(self):
+        import os, tempfile
+        from helpers import PYSH
+        bindir = tempfile.mkdtemp()
+        os.symlink(PYSH, os.path.join(bindir, "pysh"))
+        p = self.script("print('via env')", shebang="#!/usr/bin/env pysh")
+        r = self.execute(p, env=dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"]))
+        self.assertEqual(r.stdout.strip(), "via env")
+
+    def test_shebang_with_option(self):
+        p = self.script("echo one\nfalse\necho two", shebang="#!%s -e" % os.environ.get("PYSH", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "pysh")))
+        r = self.execute(p)
+        self.assertEqual((r.stdout, r.returncode), ("one\n", 1))
+
+    def test_traceback_names_the_file_and_line(self):
+        p = self.script("x = 1\n\ny = 2\nraise RuntimeError('here')\n")
+        r = self.execute(p)
+        self.assertIn(f'File "{p}", line 5', r.stderr)             # line 1 is the shebang
+        self.assertIn("raise RuntimeError('here')", r.stderr)      # source line shown
+
+    def test_traceback_line_inside_a_block(self):
+        p = self.script("for i in range(2):\n    print(i)\n    if i == 1:\n        raise KeyError('k')\n")
+        self.assertIn("line 5, in <module>", self.execute(p).stderr)
+
+    def test_shell_errors_name_the_file_and_line(self):
+        p = self.script("echo fine\nnot_a_real_command_xyz\n", name="deploy")
+        self.assertIn("deploy:3: not_a_real_command_xyz: command not found", self.execute(p).stderr)
+
+    def test_stdin_passes_through(self):
+        import subprocess
+        p = self.script("import sys\nprint(sys.stdin.read().upper())\nwc -c < /dev/null")
+        r = subprocess.run([p], input="piped in", capture_output=True, text=True)
+        self.assertIn("PIPED IN", r.stdout)
+
+    def test_works_in_a_pipeline_as_a_filter(self):
+        import subprocess
+        p = self.script("import sys\nfor line in sys.stdin: print(line.strip()[::-1])")
+        r = subprocess.run(f"printf 'abc\\nxyz\\n' | {p} | tr a-z A-Z", shell=True, capture_output=True, text=True)
+        self.assertEqual(r.stdout, "CBA\nZYX\n")
+
+    def test_heredoc_and_blocks_in_a_script_file(self):
+        p = self.script("for i in range(2):\n    print(i)\ncat <<EOF\nbody $((1+1))\nEOF\n")
+        self.assertEqual(self.execute(p).stdout, "0\n1\nbody 2\n")
+
+    def test_relative_invocation(self):
+        import subprocess, os
+        p = self.script("print('rel')")
+        r = subprocess.run(["./" + os.path.basename(p)], cwd=os.path.dirname(p), capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "rel")
+
+    def test_name_is_main(self):
+        self.assertEqual(self.execute(self.script("print(__name__)")).stdout.strip(), "__main__")
+
+    def test_main_guard(self):
+        p = self.script("def main():\n    print('in main')\nif __name__ == '__main__':\n    main()\n")
+        self.assertEqual(self.execute(p).stdout.strip(), "in main")
+
+    def test_dash_dash_stops_option_parsing(self):
+        import subprocess
+        from helpers import PYSH
+        p = self.script("import sys\nprint(sys.argv[1:])")
+        r = subprocess.run([PYSH, "--", p, "-e"], capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "['-e']")

@@ -64,6 +64,23 @@ Builtins: `cd exit export unset alias unalias jobs fg bg wait kill source histor
 manage it, `cmd &` runs in the background, finished jobs are reported before the next prompt,
 and `Ctrl-C` only interrupts the foreground job.
 
+## Scripts
+
+Start a file with a shebang and `chmod +x` it:
+
+```python
+#!/usr/bin/env pysh
+import sys
+for host in sys.argv[1:]:
+    r = !(ping -c1 -W1 @(host))
+    print(host, "up" if r else "down")
+```
+
+`sys.argv`, `__file__` and `__name__ == "__main__"` behave as in Python. An uncaught exception
+prints a traceback with the real file and line and exits 1; a failing command doesn't stop the
+script unless you use `#!/usr/bin/pysh -e` (or `pysh -e script`). A Python block ends at the first
+unindented line, so shell lines can follow it directly.
+
 ## Interactive features
 
 - **Autosuggestions**: grey text from history. `→`/`End`/`Ctrl-F` accept, `Alt-F` takes a word.

@@ -3,6 +3,7 @@
 pysh \- a shell with an embedded Python interpreter
 .SH SYNOPSIS
 .B pysh
+.RB [ \-e ]
 .RB [ \-c
 .IR command " [" arg " ...]]"
 .br
@@ -42,6 +43,10 @@ Run
 Remaining arguments become
 .IR sys.argv .
 .TP
+.B \-e
+Stop at the first command that fails (scripts and
+.BR \-c ).
+.TP
 .BR \-h ", " \-\-help
 Print usage and a summary of the syntax and exit.
 The same text is printed by the
@@ -56,6 +61,51 @@ Read and run lines from a file.
 .PP
 With no arguments pysh is interactive when standard input and output are terminals.
 Otherwise it reads commands from standard input.
+.SH SCRIPTS
+A script is a file of shell and Python lines, run in order.
+Start it with a shebang line and make it executable to run it like any program:
+.PP
+.RS
+.nf
+#!/usr/bin/pysh
+import sys
+for host in sys.argv[1:]:
+    r = !(ping \-c1 \-W1 @(host))
+    print(host, "up" if r else "down")
+.fi
+.RE
+.PP
+.B #!/usr/bin/env pysh
+works too, and one option may follow the interpreter
+.RB ( "#!/usr/bin/pysh \-e" ).
+.IP \(bu 3
+The script path is
+.IR sys.argv[0] ,
+the arguments follow, and
+.I __name__
+is
+.BR __main__ .
+.IP \(bu 3
+A Python block ends at the first line that is not indented, so shell lines can follow it directly.
+.IP \(bu 3
+An uncaught Python exception prints a traceback with the real file name and line number and ends
+the script with status 1.
+A failing shell command does not end it (its status is in
+.IR last.returncode ),
+unless
+.B \-e
+is given.
+A name that is not a command reports
+.B command not found
+(status 127) with the script name and line.
+.IP \(bu 3
+The exit status is that of the last command, or the argument of
+.BR exit .
+.IP \(bu 3
+.B $name
+in a shell line is an environment variable; use
+.BI @( name )
+for a Python variable.
 .SH PYTHON AND SHELL TOGETHER
 .TP
 .BI $( cmd )

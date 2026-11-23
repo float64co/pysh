@@ -502,6 +502,29 @@ class Prompt(EditorCase):
         self.assertIn("~/a/beta", self.s.text())
 
 
+class DefaultAliases(EditorCase):
+    def test_ls_is_colored_when_supported(self):
+        import subprocess
+        supported = subprocess.run(["ls", "--color=auto", "-d", "."], capture_output=True).returncode == 0
+        self.run_cmd("alias")
+        self.assertEqual("alias ls='ls --color=auto'" in self.s.text(), supported)
+
+    def test_ls_output_is_colored_on_a_tty_but_not_in_a_pipe(self):
+        os.makedirs(os.path.join(self.s.home, "adir"))
+        self.s.raw = b""
+        self.run_cmd("ls -d adir")
+        self.assertIn("\x1b[01;34madir", self.s.raw.decode())          # directories are blue on a terminal
+        self.s.raw = b""
+        self.run_cmd("ls -d adir | cat")
+        self.assertNotIn("\x1b[01;34m", self.s.raw.decode().split("ls -d adir")[-1])
+
+    def test_rc_file_can_override(self):
+        with open(os.path.join(self.s.home, ".pyshrc.py"), "w") as f: f.write("aliases['ls'] = 'ls -1'\n")
+        s2 = Session(rows=24, cols=60, home=self.s.home); self.addCleanup(s2.close)
+        s2.send("alias\r", 0.5)
+        self.assertIn("alias ls='ls -1'", s2.text())
+
+
 class PromptSpace(EditorCase):
     def test_output_without_newline_is_not_overwritten_by_prompt(self):
         self.run_cmd("printf partial")

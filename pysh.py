@@ -1201,11 +1201,23 @@ def read_entry(tty):
         lines.append(rl("\x1b[90m…\x1b[0m "))
     return "\n".join(lines)
 
+def default_aliases():
+    """Interactive niceties: `ls` gets --color=auto when this ls supports it (checked once at startup).
+    Override or remove in ~/.pyshrc.py (aliases["ls"] = ... / del aliases["ls"])."""
+    ls = shutil.which("ls")
+    if not ls: return
+    try:
+        ok = subprocess.run([ls, "--color=auto", "-d", "."], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
+    except Exception: ok = False
+    if ok: aliases.setdefault("ls", "ls --color=auto")
+
 def repl():
     tty = os.isatty(0) and os.isatty(1)
     global _exit_warned
     if tty:
         init_job_control()
+        default_aliases()
         load_history()
         rcf = os.path.expanduser("~/.pyshrc.py")
         if os.path.exists(rcf):

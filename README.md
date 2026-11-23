@@ -71,6 +71,7 @@ and `Ctrl-C` only interrupts the foreground job.
 - **Tab completion menu** with descriptions: commands from man pages, files by type/size,
   Python attributes by type, flags parsed from `cmd --help`. Tab cycles, Enter runs the selection, Esc cancels.
 - **`Ctrl-R`** history search menu; `↑`/`↓` search history by prefix.
+- **Colored `ls`**: interactive shells alias `ls` to `ls --color=auto` when your `ls` supports it (override in `~/.pyshrc.py`).
 - **Prompt**: `user@host ~/s/c/pysh(branch)>`, with the git branch in white.
 
 ## Tests

@@ -1,5 +1,5 @@
 # pysh -- embedded shell logic.  Executed by pysh.c inside __main__.
-import ast, builtins, codeop, glob, io, keyword, operator, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, traceback
+import ast, builtins, codeop, glob, inspect, io, keyword, operator, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, traceback, types
 
 VERSION = "0.1"
 shell = sys.modules["__main__"]                # pysh's own internals: shell.jobs, shell.history, ...
@@ -132,13 +132,19 @@ def is_arith(inner):
     """inner is the text between '$(' and ')': '$((1+2))' gives '(1+2)'."""
     return inner.startswith("(") and inner.endswith(")") and match_paren(inner, 0) == len(inner)
 
-_ARITH = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.LShift: operator.lshift,
-          ast.RShift: operator.rshift, ast.BitAnd: operator.and_, ast.BitOr: operator.or_, ast.BitXor: operator.xor}
+_M = 1 << 64
+def _wrap(x):
+    """Signed 64-bit wraparound, as in bash: results stay small whatever the input."""
+    x &= _M - 1
+    return x - _M if x >= 1 << 63 else x
+
+_ARITH = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+          ast.BitAnd: operator.and_, ast.BitOr: operator.or_, ast.BitXor: operator.xor}
 _CMP = {ast.Eq: operator.eq, ast.NotEq: operator.ne, ast.Lt: operator.lt, ast.LtE: operator.le,
         ast.Gt: operator.gt, ast.GtE: operator.ge}
 
 def arith(expr):
-    """Shell-style integer arithmetic: $((1 + 2 * $X)).  Names refer to environment variables."""
+    """Shell-style integer arithmetic: $((1 + 2 * $X)).  Names refer to environment variables.  64-bit signed."""
     expr = re.sub(r"\$\{?(\w+)\}?", lambda m: getvar(m.group(1)) or "0", expr)
     expr = re.sub(r"\b0[0-7]+\b", lambda m: str(int(m.group(), 8)), expr)       # octal literals
     expr = expr.replace("&&", " and ").replace("||", " or ")
@@ -146,24 +152,26 @@ def arith(expr):
     except SyntaxError: raise SyntaxError(f"bad arithmetic expression: {expr.strip()}")
     def ev(n):
         if isinstance(n, ast.Expression): return ev(n.body)
-        if isinstance(n, ast.Constant) and type(n.value) is int: return n.value
+        if isinstance(n, ast.Constant) and type(n.value) is int: return _wrap(n.value)
         if isinstance(n, ast.Name):
-            try: return int(os.environ.get(n.id, "0") or "0", 0)
+            try: return _wrap(int(os.environ.get(n.id, "0") or "0", 0))
             except ValueError: return 0
         if isinstance(n, ast.UnaryOp):
             v = ev(n.operand)
-            if isinstance(n.op, ast.USub): return -v
+            if isinstance(n.op, ast.USub): return _wrap(-v)
             if isinstance(n.op, ast.UAdd): return v
             if isinstance(n.op, ast.Invert): return ~v
             if isinstance(n.op, ast.Not): return int(not v)
         if isinstance(n, ast.BinOp):
             a, b = ev(n.left), ev(n.right)
-            if type(n.op) in _ARITH: return _ARITH[type(n.op)](a, b)
+            if type(n.op) in _ARITH: return _wrap(_ARITH[type(n.op)](a, b))
+            if isinstance(n.op, ast.LShift): return _wrap(a << (b & 63))
+            if isinstance(n.op, ast.RShift): return a >> (b & 63)
             if isinstance(n.op, (ast.Div, ast.FloorDiv, ast.Mod)):
                 if b == 0: raise ArithmeticError("division by 0")
                 q = abs(a) // abs(b) * (1 if (a < 0) == (b < 0) else -1)       # C-style truncation
-                return q if isinstance(n.op, (ast.Div, ast.FloorDiv)) else a - b * q
-            if isinstance(n.op, ast.Pow): return a ** b if b >= 0 else 0
+                return _wrap(q) if isinstance(n.op, (ast.Div, ast.FloorDiv)) else _wrap(a - b * q)
+            if isinstance(n.op, ast.Pow): return _wrap(pow(a, b, _M)) if b >= 0 else 0
         if isinstance(n, ast.Compare):
             v = ev(n.left)
             for op, c in zip(n.ops, n.comparators):
@@ -177,6 +185,9 @@ def arith(expr):
         if isinstance(n, ast.IfExp): return ev(n.body) if ev(n.test) else ev(n.orelse)
         raise SyntaxError("unsupported operator in arithmetic expression")
     return ev(tree)
+
+_BRACE_MAX = 100_000        # items in one {a..b} range
+_BRACE_TOTAL = 1_000_000    # words one word can expand to
 
 def brace_expand(s):
     """bash-style {a,b,c} and {1..5} / {a..e} / {01..10..2} expansion on a plain string."""
@@ -203,6 +214,7 @@ def brace_expand(s):
                 step = abs(int(m.group(3))) if m.group(3) else 1
                 step = step or 1
                 width = max(len(m.group(1)), len(m.group(2))) if any(len(x) > 1 and x.lstrip("-").startswith("0") for x in m.group(1, 2)) else 0
+                if abs(b - a) // step + 1 > _BRACE_MAX: raise ArithmeticError("brace expansion too large")
                 seq = range(a, b + 1, step) if a <= b else range(a, b - 1, -step)
                 alts = [str(x).zfill(width) if width else str(x) for x in seq]
             else:
@@ -215,7 +227,9 @@ def brace_expand(s):
         if alts is None: i += 1; continue
         pre, post = s[:i], s[j+1:]
         out = []
-        for a in alts: out += brace_expand(pre + a + post)
+        for a in alts:
+            out += brace_expand(pre + a + post)
+            if len(out) > _BRACE_TOTAL: raise ArithmeticError("brace expansion too large")
         return out
     return [s]
 
@@ -395,11 +409,48 @@ def is_command(w):
     if r is None: r = _cmdcache[w] = shutil.which(w) is not None
     return r
 
+# ------------------------------------------------------------------ trust helpers
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+def clean(s):
+    """Text that came from outside (paths, branch names, history, error messages) with control characters
+    shown as '?', so it can't smuggle terminal escape sequences (title changes, clipboard writes...)."""
+    return _CTRL.sub("?", s)
+
+def _root_safe(path):
+    """Owned by root and not writable by group or others."""
+    try: st = os.stat(path)
+    except OSError: return False
+    return st.st_uid == 0 and not (st.st_mode & 0o022)
+
+def safe_path_dirs():
+    """$PATH entries that are absolute (an empty or relative entry means 'the current directory')."""
+    return [d for d in os.environ.get("PATH", "").split(os.pathsep) if d and os.path.isabs(d)]
+
+def which_safe(cmd):
+    return shutil.which(cmd, path=os.pathsep.join(safe_path_dirs()))
+
+def trusted_command(cmd):
+    """Absolute path of the program `cmd` would run, but only when it is a system program: found on an absolute
+    $PATH entry, and the file, its directory and the $PATH entry are all root-owned and not group/world
+    writable.  Anything else (a relative path, '.' on $PATH, a directory you can write to) gives None."""
+    if not cmd or "/" in cmd: return None
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d or not os.path.isabs(d):
+            if os.path.exists(os.path.join(d or ".", cmd)): return None      # this is what would run, and it isn't trusted
+            continue
+        path = os.path.join(d, cmd)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            real = os.path.realpath(path)
+            ok = _root_safe(d) and _root_safe(os.path.dirname(real)) and _root_safe(real)
+            return path if ok else None
+    return None
+
 _where = ""            # "script.psh:12: " while running a script file, for error messages
 _batch = False         # running a script / -c: an uncaught Python exception ends the run (interactive: it doesn't)
 _errexit = False       # pysh -e: a failing command ends the run
 
-def sh_error(msg): sys.stderr.write(f"pysh: {_where}{msg}\n"); sys.stderr.flush()
+def sh_error(msg): sys.stderr.write(f"pysh: {_where}{clean(str(msg))}\n"); sys.stderr.flush()
 
 def _same_dir(a, b):
     try: return os.path.samefile(a, b)
@@ -953,6 +1004,7 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
                                  env={**os.environ, **env} if env else None, **kw)
         except (FileNotFoundError, PermissionError) as e:
             sh_error(f"{argv[0]}: {'command not found' if isinstance(e, FileNotFoundError) else 'permission denied'}")
+            if INTERACTIVE and not background: _tty(os.tcsetpgrp, 0, SHELL_PGID)   # the failed child had already grabbed the terminal
             procs.append(None); prev = None
             if last_stage: tail_rc = 127
             continue
@@ -1123,6 +1175,7 @@ ns.update(shell=shell, last=last, __arith__=arith, __env__=_Env(), aliases=alias
           __live__=_scoped(lambda c: sh(c, capture=False)),
           sh=_scoped(sh), ShellError=ShellError, Process=Process)
 ns["__doc__"] = None
+ns["probe_flags"] = True                         # Tab on a -flag runs `cmd --help` for system programs; False disables
 ns["complete_ignore_dirs"] = ("/mnt/c",)   # PATH directories hidden from command completion
 ns["complete_ignore"] = (".dll", ".exe", ".vbs", ".efi", ".mof", ".bat", ".drv", ".sys", ".tlb", ".xml")   # command-name suffixes hidden from Tab completion (set in ~/.pyshrc.py)
 
@@ -1137,7 +1190,8 @@ def classify(line):
     kw = re.match(r"[A-Za-z_]\w*", s)
     if (kw and kw.group() in KW and not (kw.group() in BUILTINS)) or s.startswith("@"): return "py"
     if w in BUILTINS and w not in ns and not s[len(w):].lstrip().startswith(("(", "=", ".", "[")): return "sh"
-    py = preprocess(s)
+    try: py = preprocess(s)
+    except SyntaxError: return "sh"                    # e.g. an unbalanced $( : the shell parser reports it
     try: code = codeop.compile_command(py, "<pysh>", "single")
     except (SyntaxError, ValueError, OverflowError): return "sh"
     if code is None:                                  # unfinished: an open bracket/string, or a block header
@@ -1254,7 +1308,7 @@ def git_branch():
             g = os.path.join(d, t[7:].strip())
         head = open(os.path.join(g, "HEAD")).read().strip()
     except OSError: return None
-    return head[16:] if head.startswith("ref: refs/heads/") else head[:7] if head else None
+    return clean(head[16:] if head.startswith("ref: refs/heads/") else head[:7]) if head else None
 
 def prompt():
     _cmdcache.clear()
@@ -1265,8 +1319,9 @@ def prompt():
     rc = f"\x1b[31m[{last.returncode}]\x1b[0m" if last.returncode else ""
     b = git_branch()
     br = f"\x1b[37m({b})\x1b[0m" if b else ""
-    user = os.environ.get("USER") or "user"
-    host = os.uname().nodename.split(".")[0]
+    user = clean(os.environ.get("USER") or "user")
+    host = clean(os.uname().nodename.split(".")[0])
+    short = clean(short)
     return f"\x1b[32m{user}@{host}\x1b[0m \x1b[36m{short}\x1b[0m{br}{rc}\x1b[90m>\x1b[0m "
 
 # ------------------------------------------------- fish-style autosuggest/highlight
@@ -1276,7 +1331,7 @@ def _valid_cmd(w):
 def suggest(buf):
     if not buf.strip() or "\n" in buf: return ""
     for h in reversed(history):
-        if h.startswith(buf) and len(h) > len(buf) and "\n" not in h: return h[len(buf):]
+        if h.startswith(buf) and len(h) > len(buf) and "\n" not in h: return clean(h[len(buf):])
     return ""
 
 _SHTOK = re.compile(r"""(?P<ws>\s+)|(?P<str>'[^']*'?|"(?:\\.|[^"\\])*"?)|(?P<op>\|\||&&|>>|[0-9]?>&[0-9]|[|;&<>])
@@ -1285,6 +1340,7 @@ _PYTOK = re.compile(r"""(?P<str>(?:[rbfRBF]{0,2})(?:\"\"\"[\s\S]*?(?:\"\"\"|$)|'
 C = lambda n, t: f"\x1b[{n}m{t}\x1b[0m"
 
 def highlight(buf):
+    buf = _CTRL.sub("?", buf)                 # same width, so the cursor math still holds
     m = re.match(r"(\s*)%", buf)
     if m: return m.group(1) + C(90, "%") + highlight_sh(buf[m.end():])
     try: kind = classify(buf) if buf.strip() else "sh"
@@ -1327,12 +1383,16 @@ def highlight_sh(buf):
 
 _helpcache = {}
 def flags_for(cmd):
-    """Parse `cmd --help` into [(flag, description)] (cached, 1.5s timeout)."""
+    """Parse `cmd --help` into [(flag, description)] (cached, 1.5s timeout).
+
+    This runs the program, so it is limited to system programs (see trusted_command) and can be turned off
+    with `probe_flags = False` in ~/.pyshrc.py."""
+    if not ns.get("probe_flags", True): return []
     if cmd in _helpcache: return _helpcache[cmd]
-    res, path = [], shutil.which(cmd)
+    res, path = [], trusted_command(cmd)
     if path:
         try:
-            r = subprocess.run([path, "--help"], stdin=subprocess.DEVNULL, capture_output=True,
+            r = subprocess.run([path, "--help"], stdin=subprocess.DEVNULL, capture_output=True, cwd="/",
                                timeout=1.5, text=True, errors="replace")
             seen = set()
             for line in (r.stdout or r.stderr).splitlines():
@@ -1341,9 +1401,9 @@ def flags_for(cmd):
                 parts = re.split(r"\s{2,}", t, 1)
                 spec, desc = parts[0], (parts[1] if len(parts) > 1 else "")
                 for f in re.findall(r"(?:^|[\s,|])(--?[A-Za-z0-9][\w-]*)", spec):
-                    if f not in seen: seen.add(f); res.append((f, desc.strip()[:70]))
+                    if f not in seen: seen.add(f); res.append((f, clean(desc.strip()[:70])))
         except Exception: pass
-    _helpcache[cmd] = res
+        _helpcache[cmd] = res
     return res
 
 _mandb = None
@@ -1353,12 +1413,14 @@ def man_desc():
     if _mandb is None:
         _mandb = {}
         try:
-            r = subprocess.run(["whatis", "-l", "-s", "1,6,8", "-r", ".*"], stdin=subprocess.DEVNULL,
-                               capture_output=True, timeout=3, text=True, errors="replace",
+            whatis = which_safe("whatis")
+            if not whatis: return _mandb
+            r = subprocess.run([whatis, "-l", "-s", "1,6,8", "-r", ".*"], stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=3, text=True, errors="replace", cwd="/",
                                env={**os.environ, "LC_ALL": "C"})
             for line in r.stdout.splitlines():
                 m = re.match(r"(\S+)\s+\((\w+)\)\s+- (.*)", line)
-                if m and (m.group(1) not in _mandb or m.group(2) == "1"): _mandb[m.group(1)] = m.group(3)
+                if m and (m.group(1) not in _mandb or m.group(2) == "1"): _mandb[m.group(1)] = clean(m.group(3))
         except Exception: pass
     return _mandb
 
@@ -1379,6 +1441,22 @@ def _human(n):
         n /= 1024
 
 def _esc(w): return re.sub(r"([ \t'\"\\$&;|<>()*?#])", r"\\\1", w)
+
+_DOTTED = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
+
+def _dotted(base):
+    """Look up `a.b.c` without evaluating anything else (no calls, no indexing) and without running properties."""
+    if not _DOTTED.fullmatch(base): raise ValueError(base)
+    first, *rest = base.split(".")
+    obj = ns[first] if first in ns else getattr(builtins, first)
+    for name in rest:
+        try:
+            attr = inspect.getattr_static(obj, name)
+            if isinstance(attr, property): raise ValueError(name)       # would run user code
+            obj = getattr(obj, name) if not isinstance(attr, (types.ModuleType, type)) else attr
+        except AttributeError:
+            obj = getattr(obj, name)                                    # dynamic attribute (__getattr__)
+    return obj
 
 def complete(before):
     """-> (text_before_cursor_with_common_prefix, [(full_text, display, description)])"""
@@ -1416,7 +1494,7 @@ def complete(before):
     elif "." in word and "/" not in word and classify(before) == "py":
         base, _, attr = word.rpartition(".")
         try:
-            obj = eval(base, ns); nospace = True
+            obj = _dotted(base); nospace = True
             for a in dir(obj):
                 if a.startswith(attr) and (attr or not a.startswith("_")):
                     try: ty = type(getattr(obj, a)).__name__
@@ -1456,14 +1534,18 @@ def search_history(query):
 
 def load_history():
     try:
+        st = os.stat(HIST)
+        if st.st_uid == os.getuid() and st.st_mode & 0o077: os.chmod(HIST, 0o600)       # it may hold secrets
         with open(HIST) as f: history.extend(l.rstrip("\n") for l in f if l.strip())
     except OSError: pass
 
 def save_history(line):
+    if line.startswith(" "): return                 # like bash's ignorespace: a leading space keeps a command out of history
     if line.strip() and (not history or history[-1] != line):
         history.append(line)
         try:
-            with open(HIST, "a") as f: f.write(line + "\n")
+            fd = os.open(HIST, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a") as f: f.write(line + "\n")
         except OSError: pass
 
 def read_entry(tty):
@@ -1496,10 +1578,10 @@ def read_entry(tty):
 def default_aliases():
     """Interactive niceties: `ls` gets --color=auto when this ls supports it (checked once at startup).
     Override or remove in ~/.pyshrc.py (aliases["ls"] = ... / del aliases["ls"])."""
-    ls = shutil.which("ls")
+    ls = which_safe("ls")                     # never a './ls' picked up through a relative PATH entry
     if not ls: return
     try:
-        ok = subprocess.run([ls, "--color=auto", "-d", "."], stdin=subprocess.DEVNULL,
+        ok = subprocess.run([ls, "--color=auto", "-d", "."], stdin=subprocess.DEVNULL, cwd="/",
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
     except Exception: ok = False
     if ok: aliases.setdefault("ls", "ls --color=auto")
@@ -1515,6 +1597,7 @@ def repl():
         if os.path.exists(rcf):
             try: exec(compile(open(rcf).read(), rcf, "exec"), ns)
             except Exception: traceback.print_exc()
+    internal_errors = 0
     while True:
         try: line = read_entry(tty)
         except EOFError:
@@ -1522,12 +1605,19 @@ def repl():
                 _exit_warned = True; print(); sh_error("there are stopped jobs (^D again to leave)"); continue
             break
         except KeyboardInterrupt: continue
+        except Exception as e:                                     # a bug must not log you out
+            internal_errors += 1
+            sh_error(f"internal error while reading input: {type(e).__name__}: {e}")
+            if internal_errors > 20: return 70
+            continue
         if not line.strip(): continue
         if tty: save_history(line)
         _exit_warned = False if not line.strip().startswith(("exit", "quit")) else _exit_warned
         try: run_line(line)
         except SystemExit as e: hup_jobs(); return int(e.code or 0) if not isinstance(e.code, str) else 1
         except KeyboardInterrupt: print()
+        except Exception as e:
+            sh_error(f"internal error: {type(e).__name__}: {e}"); _setlast(Result(70, cmd=line))
     if tty: print()
     hup_jobs()
     return last.returncode

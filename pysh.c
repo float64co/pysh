@@ -336,6 +336,14 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
     sigaction(SIGWINCH, &sa, &old_sa);
     g_winch = 0; pushback = -1;
     int reflow = terminal_reflows();
+    {   /* Safety net: if a child left itself as the terminal's foreground group (e.g. it died before exec), take it
+         * back; otherwise our reads fail with EIO and the shell would think its input has ended. */
+        struct sigaction ttou;
+        if (sigaction(SIGTTOU, NULL, &ttou) == 0 && ttou.sa_handler == SIG_IGN) {
+            pid_t fg = tcgetpgrp(0);
+            if (fg > 0 && fg != getpgrp()) tcsetpgrp(0, getpgrp());
+        }
+    }
 
     static char buf[MAXLINE], saved[MAXLINE];
     int len = 0, pos = 0;

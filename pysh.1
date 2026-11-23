@@ -526,6 +526,29 @@ Tuple of file name suffixes never offered when completing command names
 (default: a list of Windows executable suffixes such as
 .BR .exe " and " .dll ).
 .TP
+.B probe_flags
+Tab on a word starting with
+.B \-
+runs
+.I command
+.B \-\-help
+to read its options.
+The default,
+.BR True ,
+is limited to system programs: found on an absolute
+.B PATH
+entry, with the file, its directory and the
+.B PATH
+entry owned by root and not writable by group or others.
+Relative paths, a
+.B .
+or empty
+.B PATH
+entry, and directories you can write to are never probed.
+Set it to
+.B False
+to switch probing off.
+.TP
 .B complete_ignore_dirs
 Tuple of
 .B PATH
@@ -536,6 +559,26 @@ When a command's output does not end with a newline, the next prompt starts on a
 reverse\-video
 .B %
 shows where the output stopped.
+.SH SECURITY
+.IP \(bu 3
+Completion does not evaluate what is typed: Python attribute completion looks up plain dotted names only.
+.IP \(bu 3
+Directory names, git branch names, history entries, option descriptions and error messages are shown with
+control characters replaced by
+.BR ? ,
+so hostile text cannot send terminal escape sequences (title changes, clipboard writes) through the prompt.
+.IP \(bu 3
+The history file is created with mode 0600 (and tightened if it already exists).
+A command line that starts with a space is not recorded in it.
+.IP \(bu 3
+Helper programs run by pysh itself (\fBls\fR, \fBwhatis\fR) are looked up only in absolute
+.B PATH
+entries.
+.IP \(bu 3
+Arithmetic is signed 64-bit with wraparound, and brace expansion is limited to 100,000 items per range and
+1,000,000 words per word.
+.IP \(bu 3
+Text pasted with embedded newlines is run line by line; there is no bracketed paste.
 .SH FILES
 .TP
 .I ~/.pyshrc.py

@@ -161,6 +161,27 @@ unindented line, so shell lines can follow it directly.
 - **Colored `ls`**: interactive shells alias `ls` to `ls --color=auto` when your `ls` supports it (override in `~/.pyshrc.py`).
 - **Prompt**: `user@host ~/s/c/pysh(branch)>`, with the git branch in white.
 
+## Security notes
+
+- **Flag probing.** Tab on a `-flag` runs `<command> --help` to read the options. This is on by default but
+  limited to system programs: found on an absolute `$PATH` entry, with the file, its directory and the `$PATH`
+  entry owned by root and not group/world-writable. A relative path (`./tool`), a `.` or empty `$PATH` entry,
+  or a program in a directory you can write to is never run. Set `probe_flags = False` in `~/.pyshrc.py` to turn
+  it off.
+- **Completion never evaluates what you type.** Python attribute completion looks up plain dotted names only
+  (no calls, no indexing, no properties).
+- **Untrusted text is neutralised.** Directory names, git branch names, history entries, `--help` output and
+  error messages are shown with control characters replaced by `?`, so a hostile directory or repository can't
+  change your window title or write to the clipboard through your prompt.
+- **History is private.** `~/.pysh_history` is created mode 0600 (and tightened if it exists); a command that
+  starts with a space is not recorded.
+- **Helper programs** (`ls` for the colour check, `whatis` for descriptions) are only taken from absolute
+  `$PATH` entries, so a `.` in `$PATH` can't run something from the current directory at startup.
+- **Arithmetic is 64-bit** like a real shell (`$((2**63))` wraps), and brace expansion refuses ranges over
+  100,000 items or 1,000,000 words, so a script can't be made to hang or exhaust memory by one expression.
+- pysh is not setuid and runs with your privileges; `~/.pyshrc.py` is trusted code. Pasting text that contains
+  newlines still runs it line by line (no bracketed paste yet), so be careful pasting from web pages.
+
 ## Tests
 
 ```sh
@@ -179,6 +200,7 @@ VT100 emulator (`tests/term.py`), so they check what a terminal would show, incl
 aliases["ll"] = "ls -l"
 complete_ignore = (".dll", ".exe")      # suffixes hidden from command completion
 complete_ignore_dirs = ("/mnt/c",)      # PATH directories hidden from completion
+probe_flags = False                    # don't run `cmd --help` for flag completion (default True)
 def prompt(): return f"{os.getcwd()} $ "
 ```
 

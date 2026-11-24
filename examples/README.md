@@ -1,10 +1,10 @@
 # pysh examples
 
-Fourteen working scripts that each mix shell commands and Python in one file. Every one starts with
+Fifteen working scripts that each mix shell commands and Python in one file. Every one starts with
 `#!/usr/local/bin/pysh`, takes `--help`, and runs with no arguments (or fails with a clear usage
 message, where it needs a target). They use only libraries that are already installed with the
-system Python: pandas, numpy, scipy, rich, psutil, networkx, cryptography, lxml, jinja2, pwntools
-and ollama, plus tools such as `git`, `du`, `ss`, `nmap` and `file`.
+system Python: pandas, numpy, scipy, rich, psutil, networkx, cryptography, lxml, jinja2, pwntools,
+cupy and ollama, plus tools such as `git`, `du`, `ss`, `nmap` and `file`.
 
 Run one directly (`./examples/diskhog.sh`) or through the interpreter (`pysh examples/diskhog.sh`).
 If `pysh` isn't installed at `/usr/local/bin/pysh`, use the second form or edit the first line.
@@ -25,12 +25,13 @@ If `pysh` isn't installed at `/usr/local/bin/pysh`, use the second form or edit 
 | `llm-commit.sh` | drafts a commit message from `git diff --staged` with a local Ollama model | `$(git …)`, `$[git commit -e …]` |
 | `portscan.sh` | connect scan, banners, nmap service detection, Markdown report | `!(nmap …)` + lxml + jinja2 |
 | `ropnotes.sh` | pwntools tour of an ELF: checksec, imports, cyclic patterns, asm/disasm | `$(file -b …)` + pwntools |
+| `gpubench.sh` | NumPy on the CPU vs CuPy on the GPU: matmul, FFT, sort, reduction, fused kernel; `--mandelbrot` draws a fractal | `!(nvidia-smi …)` facts, cupy, same-answer checks |
 
 ## Things to know
 
 - **Safe by default.** `portscan.sh` only scans loopback and private addresses unless you pass
   `--i-am-authorized`. `authlog.sh` prints firewall commands but never runs them. `ropnotes.sh` and
-  `hashsweep.sh` only read files. `llm-commit.sh` talks only to your local Ollama server and only
+  `hashsweep.sh` only read files. `gpubench.sh` needs a CUDA GPU and says so (exit 1) if there isn't one. `llm-commit.sh` talks only to your local Ollama server and only
   commits if you pass `--commit` (and then opens your editor first).
 - **Untrusted text is neutralised.** File names, log lines, banners, CSV headers and model output can
   be written by someone else, so every script strips control characters and escapes rich markup

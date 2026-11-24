@@ -11,6 +11,14 @@ def have(*mods):
     return all(importlib.util.find_spec(m) for m in mods)
 
 
+def gpu_available():
+    try:
+        import cupy
+        return cupy.cuda.runtime.getDeviceCount() > 0
+    except Exception:
+        return False
+
+
 def example(name, *args, stdin=None, cwd=None, timeout=90, env=None):
     # HOME stays real: user-installed packages (~/.local) must stay importable. Caches go to a temp dir instead.
     e = dict(os.environ, XDG_CACHE_HOME=tempfile.gettempdir(), TERM="dumb", COLUMNS="120", **(env or {}))
@@ -28,7 +36,7 @@ def git(cwd, *args):
 
 class Every(unittest.TestCase):
     def test_there_are_examples(self):
-        self.assertGreaterEqual(len(SCRIPTS), 14)
+        self.assertGreaterEqual(len(SCRIPTS), 15)
 
     def test_shebang_and_executable(self):
         for p in SCRIPTS:
@@ -467,6 +475,44 @@ class RopNotes(unittest.TestCase):
     def test_bad_assembly_is_reported(self):
         r = example("ropnotes.sh", "--asm", "nonsense instruction", timeout=120)
         self.assertEqual(r.returncode, 1); self.assertNotIn("Traceback", r.stderr)
+
+
+@unittest.skipUnless(have("cupy", "numpy", "rich") and gpu_available(), "needs cupy and a CUDA GPU")
+class GpuBench(unittest.TestCase):
+    def test_every_workload_matches_the_cpu(self):
+        r = example("gpubench.sh", "-n", "128", "-r", "2", timeout=180)
+        self.assertEqual(r.returncode, 0, r.all)
+        for name in ("matmul", "fft", "sort", "sum", "fused"): self.assertIn(name, r.stdout)
+        self.assertEqual(r.stdout.count(" yes "), 5, r.stdout)
+        self.assertIn("cupy", r.stdout)
+
+    def test_subset_and_float64(self):
+        r = example("gpubench.sh", "-n", "64", "-k", "sum,sort", "--dtype", "float64", "-r", "1", timeout=180)
+        self.assertEqual(r.returncode, 0, r.all)
+        self.assertIn("float64 is slow", r.stdout)
+        self.assertNotIn("matmul", r.stdout)
+
+    def test_mandelbrot(self):
+        r = example("gpubench.sh", "--mandelbrot", "--width", "120", "--iters", "30", timeout=180)
+        self.assertEqual(r.returncode, 0, r.all)
+        self.assertIn("120×80 points", r.stdout)
+        self.assertIn("@", r.stdout)                              # the inside of the set
+
+    def test_bad_workload_and_oversized_problem(self):
+        r = example("gpubench.sh", "-k", "nope")
+        self.assertEqual(r.returncode, 2); self.assertIn("unknown workload", r.stderr)
+        r = example("gpubench.sh", "-n", "100000", timeout=180)
+        self.assertEqual(r.returncode, 1); self.assertIn("GPU memory", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+
+
+@unittest.skipUnless(have("cupy"), "needs cupy")
+class GpuBenchWithoutAGpu(unittest.TestCase):
+    def test_no_visible_device_is_a_clear_error(self):
+        r = example("gpubench.sh", env={"CUDA_VISIBLE_DEVICES": ""}, timeout=120)
+        self.assertEqual(r.returncode, 1, r.all)
+        self.assertIn("no CUDA GPU", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
 
 
 if __name__ == "__main__":

@@ -1315,8 +1315,7 @@ def prompt():
     _cmdcache.clear()
     cwd = logical_cwd(); home = os.path.expanduser("~")
     if cwd == home or cwd.startswith(home + "/"): cwd = "~" + cwd[len(home):]
-    parts = cwd.split("/")                      # fish-style prompt_pwd: shorten parents
-    short = "/".join([p[:1] if p and p != "~" else p for p in parts[:-1]] + parts[-1:])
+    short = cwd                                 # the full path, never abbreviated
     rc = f"\x1b[31m[{last.returncode}]\x1b[0m" if last.returncode else ""
     b = git_branch()
     br = f"\x1b[37m({b})\x1b[0m" if b else ""
@@ -1370,7 +1369,7 @@ def highlight_sh(buf):
         if k == "w":
             if cmd and re.match(r"[A-Za-z_]\w*=", t): out.append(t); continue
             if cmd:
-                out.append(C(34, t) if _valid_cmd(t) else C(31, t)); cmd = False
+                out.append(t); cmd = False                          # the program name keeps the default colour, like its arguments
             elif t.startswith("$") or t.startswith("@("): out.append(C(36, t))
             elif os.path.exists(os.path.expanduser(t)) and not t.startswith("-"): out.append(f"\x1b[4m{t}\x1b[0m")
             else: out.append(t)

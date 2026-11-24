@@ -7,12 +7,12 @@ on your system, so `import` finds the same modules your `python` does.
 ![pysh screenshot](screenshot.png)
 
 ```
-~/s/c/pysh(main)> x = 6 * 7
-~/s/c/pysh(main)> x
+~/src/c/pysh(main)> x = 6 * 7
+~/src/c/pysh(main)> x
 42
-~/s/c/pysh(main)> ls -la | wc -l
+~/src/c/pysh(main)> ls -la | wc -l
 12
-~/s/c/pysh(main)> files = $(ls).split()
+~/src/c/pysh(main)> files = $(ls).split()
 ```
 
 ## Build
@@ -151,20 +151,20 @@ script unless you use `#!/usr/bin/pysh -e` (or `pysh -e script`). A Python block
 unindented line, so shell lines can follow it directly.
 
 `sys.exit(3)` sets the exit status; `sys.exit("message")` prints the message to standard error and exits 1,
-as in Python. Fourteen complete, tested scripts are in [`examples/`](examples/) (disk usage, TLS expiry
-checks, flaky-test detection, import graphs, a local-LLM commit-message drafter, and more); each
+as in Python. Fifteen complete, tested scripts are in [`examples/`](examples/) (disk usage, TLS expiry
+checks, flaky-test detection, import graphs, a local-LLM commit-message drafter, a CPU-vs-GPU benchmark with CuPy, and more); each
 supports `--help`.
 
 ## Interactive features
 
 - **Autosuggestions**: grey text from history. `→`/`End`/`Ctrl-F` accept, `Alt-F` takes a word.
-- **Highlighting**: valid commands blue, unknown red, strings yellow, paths underlined.
+- **Highlighting**: strings yellow, numbers and operators cyan, Python keywords blue, paths underlined. Program names keep the plain colour of their arguments.
 - **Tab completion menu** with descriptions: commands from man pages, files by type/size,
   Python attributes by type, flags parsed from `cmd --help`. Tab cycles, Enter runs the selection, Esc cancels.
 - **Pasting**: text that arrives in one go (a paste, or typing ahead while a command runs) is inserted in one step and repainted once, so large pastes are fast.
 - **`Ctrl-R`** history search menu; `↑`/`↓` search history by prefix.
 - **Colored `ls`**: interactive shells alias `ls` to `ls --color=auto` when your `ls` supports it (override in `~/.pyshrc.py`).
-- **Prompt**: `user@host ~/s/c/pysh(branch)>`, with the git branch in white.
+- **Prompt**: `user@host ~/src/c/pysh(branch)>`, with the git branch in white.
 
 ## Security notes
 

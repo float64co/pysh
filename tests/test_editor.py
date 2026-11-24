@@ -479,11 +479,13 @@ class WideMenu(EditorCase):
 
 
 class Highlighting(EditorCase):
-    def test_unknown_command_red_known_blue(self):
+    def test_program_names_are_not_coloured(self):
         self.type("zzzznotacmd")
-        self.assertIn("\x1b[31mzzzznotacmd", self.s.raw.decode())
-        self.type(CTRL("u") + "ls")
-        self.assertIn("\x1b[34mls", self.s.raw.decode())
+        raw = self.s.raw.decode()
+        self.assertNotIn("\x1b[31mzzzznotacmd", raw)            # neither "unknown" red…
+        self.type(CTRL("u") + "ls -l")
+        raw = self.s.raw.decode()
+        self.assertNotIn("\x1b[34mls", raw)                       # …nor "known" blue
 
     def test_numbers_match_the_prompts_directory_colour(self):
         self.type("len([1])+50")
@@ -517,10 +519,11 @@ class Prompt(EditorCase):
         self.run_cmd("false")
         self.assertIn("[1]>", self.s.text())
 
-    def test_parent_dirs_shortened(self):
-        os.makedirs(os.path.join(self.s.home, "alpha", "beta"))
-        self.run_cmd("cd alpha/beta")
-        self.assertIn("~/a/beta", self.s.text())
+    def test_full_path_is_shown(self):
+        os.makedirs(os.path.join(self.s.home, "alpha", "beta", "gamma"))
+        self.run_cmd("cd alpha/beta/gamma")
+        self.assertIn("~/alpha/beta/gamma>", self.s.text())
+        self.assertNotIn("~/a/b/gamma", self.s.text())
 
 
 class DefaultAliases(EditorCase):
@@ -576,7 +579,7 @@ class ForceShellEditing(EditorCase):
         self.type("% ls")
         raw = self.s.raw.decode()
         self.assertIn("\x1b[90m%", raw)
-        self.assertIn("\x1b[34mls", raw)                          # still judged as a command
+        self.assertNotIn("\x1b[34mls", raw)                       # the program name stays plain
 
     def test_completion_after_percent_keeps_the_percent(self):
         os.makedirs(os.path.join(self.s.home, "uniq_dir_abc"), exist_ok=True)

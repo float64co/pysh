@@ -3,6 +3,8 @@
 A shell and a Python REPL in one executable. Every line is Python if it parses
 as Python, and a shell command otherwise. It embeds the CPython that is installed
 on your system, so `import` finds the same modules your `python` does.
+Python functions can be [stages in a pipeline](#python-in-pipelines), and a pipeline's result can go
+straight into a variable.
 
 ![pysh screenshot](screenshot.png)
 
@@ -13,6 +15,8 @@ on your system, so `import` finds the same modules your `python` does.
 ~/src/c/pysh(main)> ls -la | wc -l
 12
 ~/src/c/pysh(main)> files = $(ls).split()
+~/src/c/pysh(main)> ps aux | grep ssh | hits=@lines
+~/src/c/pysh(main)> cat package.json | @(lambda f: json.load(f)["name"])    # after: import json
 ```
 
 ## Build
@@ -51,6 +55,8 @@ pysh --help | --version
 | `![cmd]`    | a `Process` you read while it runs: `for line in ![tail -f log]:` |
 | `$[cmd]`    | run attached to the terminal (live; interactive programs work), returns a `Result` |
 | `% cmd`     | a leading `%` forces shell mode: `% X=1; make`                      |
+| `cmd \| @fn` | a [Python pipeline stage](#python-in-pipelines): `fn` gets a text stream |
+| `cmd \| x=@fn` | put the result in `x` (`x=@` keeps the raw text, `x=@tee` also shows it) |
 | `last`      | the `Result` of the previous command                        |
 | `aliases`   | dict; `aliases["ll"] = "ls -l"` or a function(args)         |
 
@@ -135,6 +141,135 @@ link's parent; `cd -P` resolves them), and `pwd` is a builtin (`pwd -P` for the 
 manage it, `cmd &` runs in the background, finished jobs are reported before the next prompt,
 and `Ctrl-C` only interrupts the foreground job.
 
+## Python in pipelines
+
+A pipeline stage can be Python. Write `@name` or `@(expression)` where a command would go, and use
+`name=@...` to get results straight into variables:
+
+```python
+import json
+curl -sf https://api.github.com/repos/python/cpython | repo=@json.load
+ps aux | grep ssh | hits=@lines
+@(sorted(hits, key=len)) | head -3
+```
+
+Five forms cover it:
+
+| form | meaning | where |
+|---|---|---|
+| `... \| @fn` / `@(expr)` | run Python on the stream | any stage |
+| `name=@fn` | keep what `fn` returns | last stage |
+| `name=@` | keep the raw text | any stage |
+| `name=@tee` / `@tee` | keep (or not) and show it as it goes past | any stage |
+| `@rows \| ...` | Python as the source | first stage |
+
+### Stages
+
+The function receives a **text stream**, like `sys.stdin`, so many existing functions work unchanged:
+
+```python
+cat sales.csv | @pd.read_csv                      # after: import pandas as pd
+cat data.json | @json.load                        # json.load, not json.loads (that takes a string)
+cat words.txt | @(lambda f: len(f.read().split()))
+
+def errors(stream):                               # a generator streams, so this works on `tail -f`
+    for line in stream:
+        if "ERROR" in line: yield line
+tail -f app.log | @errors | head
+
+def grep_re(stream, pattern):                     # extra words arrive as string arguments
+    return (l for l in stream if re.search(pattern, l))
+ps aux | @grep_re 'ssh|nginx'
+```
+
+| the function returns | what comes out |
+|---|---|
+| `None` | nothing (it printed for itself; `print` goes to the stage's output) |
+| a string or bytes | that text, as is |
+| a list, tuple, generator or other iterator | one item per line |
+| anything else (dict, DataFrame, number) | its printed form |
+
+`@name` takes a dotted name; use `@(...)` for anything else, such as `@(functools.partial(f, 2))`.
+`@(...)` is a stage only if its value is callable. If `cmd` holds the string `"wc"`, then `ls | @(cmd) -l`
+still runs the program `wc`.
+Redirections work as usual (`@fn < in.txt > out.txt`, `2> err.txt`, `<<<`, here-documents).
+
+### Getting results into variables
+
+```python
+curl -sf $URL | data=@json.load                   # the function's result
+ls | files=@lines                                 # `lines` is built in: lines without newlines
+date | today=@                                    # raw text, trailing newline included
+curl -sf $URL | raw=@tee | @json.load             # keep a copy, show it, and parse it
+ps aux | all=@ | grep ssh | hits=@lines           # before and after a filter
+make 2>&1 | log=@tee | grep -i error
+data=@json.load < config.json
+```
+
+- The names are **Python** variables in your session, not environment variables.
+- Generators and other iterators become lists. At the prompt an assignment prints nothing.
+- A returned value you don't assign is also kept in `_` at the prompt, and `!( ... )` has it as `.value`:
+  `r = !(cat data.json | @json.load); r.value`.
+- `X=@something cmd` (nothing piped into it) and `X='@something'` are still environment assignments.
+
+### When something fails
+
+A variable is **left as it was** if any command before it fails, or its function raises, and the status is
+non-zero. So use `curl -f`, which makes an HTTP error count as a failure. A failure *after* a capture doesn't
+undo it: in `curl -sf $URL | raw=@ | data=@json.load`, `raw` is set even if the reply isn't JSON.
+
+**Finding nothing is not a failure.** When `grep`, `egrep`, `fgrep`, `zgrep`, `rg`, `ag` or `pgrep` exits 1,
+the variable gets the empty value (`[]` from `@lines`, `""` from `name=@`), the status stays 1 so `&&` and `||`
+behave, and `-e` carries on:
+
+```python
+grep zebra animals.txt | hits=@lines || echo none
+```
+
+Add your own such commands with `no_match_commands |= {"mytool"}`. A wrapper hides the command, so
+`sudo grep` that finds nothing leaves the variable alone. `sh(..., check=True)` still raises on status 1.
+
+Without a capture, a pipeline's status is its last stage's, so a failing `git` in `git log | @parse` goes
+unnoticed. `set_pipefail = True` (in a script or `~/.pyshrc`) makes any stage's failure count; a command
+cut off because a later stage stopped reading (`yes | head -1`) doesn't. With `-e` that stops the script.
+
+### Python as the source
+
+```python
+rows = ["pear", "apple"]
+@rows | sort                                      # a value is written out
+@mygen 100 | head                                 # a function is called, with the words as arguments
+@(df.to_csv()) | wc -l
+```
+
+A line that starts with `@` is a decorator unless it has a `|`, `<` or `>` outside brackets (or words after
+`@(...)`), so `@property` and `@lru_cache(maxsize=2)` are unaffected.
+
+### In scripts and functions
+
+Top-level lines of a script use these forms directly. Indented Python blocks hold Python only, so inside an
+`if`, loop or function write the pipeline as `$[...]` (output to the terminal) or `!(...)` (captured):
+
+```python
+if verbose:
+    $[ps aux | procs=@lines]                      # sets the global `procs`
+
+def users():
+    return !(cut -d: -f1 /etc/passwd | @lines).value
+```
+
+### Things to know
+
+- The **last stage runs in the shell**, so variables it changes stay changed. Earlier stages run in forked
+  copies: they stream like any program, but their changes are lost, and they can't use a GPU the shell has
+  already initialised (put CuPy work last).
+- A pipeline ending in Python or a capture can't be suspended with Ctrl-Z; Ctrl-C interrupts it.
+- Captures can't be used with `&` or `![...]`. Captured text is held in memory.
+- `sh(..., timeout=...)` stops the programs in a pipeline but can't interrupt Python running in the shell.
+- Tab completion and highlighting don't know about `@name` yet.
+
+See `examples/logwatch.sh`, `examples/apipeek.sh` and `examples/inventory.sh`.
+
 ## Scripts
 
 Start a file with a shebang and `chmod +x` it:
@@ -153,7 +288,7 @@ script unless you use `#!/usr/bin/pysh -e` (or `pysh -e script`). A Python block
 unindented line, so shell lines can follow it directly.
 
 `sys.exit(3)` sets the exit status; `sys.exit("message")` prints the message to standard error and exits 1,
-as in Python. Fifteen complete, tested scripts are in [`examples/`](examples/) (disk usage, TLS expiry
+as in Python. Eighteen complete, tested scripts are in [`examples/`](examples/) (disk usage, TLS expiry
 checks, flaky-test detection, import graphs, a local-LLM commit-message drafter, a CPU-vs-GPU benchmark with CuPy, and more); each
 supports `--help`.
 
@@ -188,7 +323,9 @@ For an editor that returns immediately, use its waiting option, e.g. `export EDI
 - **Flag probing.** Tab on a `-flag` runs `<command> --help` to read the options. This is on by default but
   limited to system programs: found on an absolute `$PATH` entry, with the file, its directory and the `$PATH`
   entry owned by root and not group/world-writable. A relative path (`./tool`), a `.` or empty `$PATH` entry,
-  or a program in a directory you can write to is never run. Set `probe_flags = False` in `~/.pyshrc` to turn
+  or a program in a directory you can write to is never run. Set `set_pipefail = True                    # a pipeline fails if any stage does
+no_match_commands |= {"mytool"}        # exit 1 means "found nothing"
+probe_flags = False` in `~/.pyshrc` to turn
   it off.
 - **`import` searches the current directory**, as `python` does: in the REPL, `-c` and piped input the first
   `sys.path` entry is `''` (it follows `cd`), and a script file searches its own directory. That is what lets

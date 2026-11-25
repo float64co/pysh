@@ -1,5 +1,5 @@
 # pysh -- embedded shell logic.  Executed by pysh.c inside __main__.
-import ast, builtins, codeop, glob, importlib, inspect, io, keyword, operator, os, re, shlex, shutil, signal, site, subprocess, sys, tempfile, threading, time, traceback, types
+import ast, builtins, codeop, collections, collections.abc, contextlib, glob, importlib, inspect, io, keyword, operator, os, re, shlex, shutil, signal, site, subprocess, sys, tempfile, threading, time, traceback, types, warnings
 
 VERSION = "0.1"
 shell = sys.modules["__main__"]                # pysh's own internals: shell.jobs, shell.history, ...
@@ -14,6 +14,8 @@ class Result:
         self.returncode, self.out, self.err = returncode, out, err
         self.duration, self.cmd = duration, cmd
         self.timed_out = False
+        self.value = None            # what a final Python stage returned
+        self.no_match = False        # status 1 only because a search found nothing: -e carries on
     def __bool__(self): return self.returncode == 0
     def __str__(self): return self.out or ""
     def __repr__(self):
@@ -483,6 +485,7 @@ def trusted_command(cmd):
     return None
 
 _where = ""            # "script.psh:12: " while running a script file, for error messages
+_at_prompt = False     # running a line typed at the prompt (so a returned value goes to `_`)
 _batch = False         # running a script / -c: an uncaught Python exception ends the run (interactive: it doesn't)
 _errexit = False       # pysh -e: a failing command ends the run
 
@@ -693,6 +696,9 @@ Python <-> shell:
   $VAR       environment variable; `$VAR = "x"` sets it
   ![cmd]     a Process you read while it runs: for line in ![tail -f log]: ...
   $[cmd]     run attached to the terminal (live, interactive programs work); returns a Result
+  cmd | @fn          a Python stage: fn gets a text stream         ... | @json.load
+  cmd | x=@fn        keep fn's result in x          x=@ keeps the raw text, x=@tee also shows it
+  set_pipefail = True    make a pipeline fail when any stage fails
   sh(cmd, tee=, check=, timeout=, stream=, capture=)   the same with options
   % cmd      a leading % forces the line to be a shell command (e.g. `% X=1; make`)
   last       the Result of the previous command
@@ -761,10 +767,18 @@ SHELL_MODE = None           # the shell's sane terminal modes, restored after ea
 jobs = []
 _exit_warned = False
 
+def _pipe_status(statuses):
+    """A pipeline's exit status: the last stage's; with `set_pipefail`, the last failure of any stage.
+    A stage killed by SIGPIPE only because a later one stopped reading doesn't count."""
+    if not statuses: return 0
+    if statuses[-1] or not ns.get("set_pipefail"): return statuses[-1]
+    return next((s for s in reversed(statuses) if s not in (0, 128 + signal.SIGPIPE)), 0)
+
 class Job:
     def __init__(self, pids, pgid, cmd):
         self.pids, self.live, self.pgid, self.cmd = list(pids), set(pids), pgid, cmd
         self.state, self.rc, self.id, self.notified, self.mode = "running", 0, 0, True, None
+        self.codes = {}                       # pid -> exit status
 
 def add_job(job):
     used = {j.id for j in jobs}; n = 1
@@ -776,8 +790,10 @@ def _note(job, pid, status):
     if os.WIFCONTINUED(status): job.state = "running"; return
     rc = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
     job.live.discard(pid)
-    if pid == job.pids[-1]: job.rc = rc
-    if not job.live: job.state = "done"
+    job.codes[pid] = rc
+    if not job.live:
+        job.state = "done"
+        job.rc = _pipe_status([job.codes.get(p, 0) for p in job.pids])
 
 def wait_job(job):
     """Block until every process of the job has exited (True) or the job stops (False)."""
@@ -990,7 +1006,8 @@ class Process:
         if self._rc is None:
             if self._rc_override is not None and not self._procs: self._rc = self._rc_override
             elif all(q.poll() is not None for q in self._procs):
-                self._rc = _status(self._last.returncode) if self._last else (self._rc_override or 127)
+                self._rc = (_pipe_status([_status(q.returncode) for q in self._procs]) if self._last
+                            else (self._rc_override or 127))
         return self._rc
 
     def wait(self, timeout=None):
@@ -1066,6 +1083,9 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
                  timeout=None, merge=False):
     sys.stdout.flush(); sys.stderr.flush()
     t0 = time.time()
+    nodes = plan_stages(pipe)
+    if nodes is not None:
+        return run_python_pipeline(nodes, capture, capture_err, background, cmdline, tee, stream, timeout, merge)
     argvs = []
     for st in pipe:
         words, env = list(st.words), {}
@@ -1110,6 +1130,7 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
     use_jobs = background or (INTERACTIVE and not capture and not capture_err and not stream and not tee)
     procs, prev, close, pgid = [], None, [], None
     tail_rc = tail_out = None            # outcome of a final stage that ran in-process / was not found
+    own_rc = {}                          # stage number -> status, for stages with no process
     for n, (st, (argv, env)) in enumerate(zip(pipe, argvs)):
         last_stage = n == len(pipe) - 1
         if not argv: raise SyntaxError("empty command")
@@ -1132,7 +1153,7 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
                 else: sys.stdout.write(o or ""); sys.stdout.flush()
             else:
                 tf = tempfile.TemporaryFile(); tf.write(data); tf.seek(0); prev = tf
-            procs.append(None)
+            procs.append(None); own_rc[n] = rc
             if last_stage: tail_rc = rc
             continue
         stdout = rout if rout is not None else (subprocess.PIPE if (not last_stage or capture or stream or tee) else None)
@@ -1150,7 +1171,7 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
         except (FileNotFoundError, PermissionError) as e:
             sh_error(f"{argv[0]}: {'command not found' if isinstance(e, FileNotFoundError) else 'permission denied'}")
             if INTERACTIVE and not background: _tty(os.tcsetpgrp, 0, SHELL_PGID)   # the failed child had already grabbed the terminal
-            procs.append(None); prev = None
+            procs.append(None); prev = None; own_rc[n] = 127
             if last_stage: tail_rc = 127
             continue
         if use_jobs or timeout:
@@ -1174,7 +1195,8 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
             if INTERACTIVE: print(f"[{job.id}] {job.pids[-1]}")
             return Result(0, None, None, 0, cmdline)
         rc = run_foreground(job)
-        if tail_rc is not None: rc = tail_rc
+        if job.state == "done":
+            rc = _pipe_status([own_rc[n] if p is None else job.codes.get(p.pid, 0) for n, p in enumerate(procs)])
         res = Result(rc, tail_out, None, time.time() - t0, cmdline)
         if killer: killer.cancel(); res.timed_out = killer.fired
         return res
@@ -1190,8 +1212,7 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
                 else: p.wait()
                 break
             except KeyboardInterrupt: pass
-        rc = _status(p.returncode)
-    if tail_rc is not None: rc = tail_rc
+    if procs: rc = _pipe_status([own_rc.get(n, 0) if p is None else _status(p.returncode) for n, p in enumerate(procs)])
     if tail_out is not None: out = tail_out
     res = Result(rc, out, err, time.time() - t0, cmdline)
     if killer: killer.cancel(); res.timed_out = killer.fired
@@ -1212,6 +1233,500 @@ def run_inproc(fn, capture, stdin_text=None):
         else: sys.stdout.write(r if r.endswith("\n") else r + "\n")
         r = 0
     return (r if isinstance(r, int) else 0), (buf.getvalue() if capture else None)
+
+# ------------------------------------------------------ Python in pipelines
+# `@name` / `@(expr)` stages and `name=@...` captures (see the README, "Python in pipelines").  Only
+# pipelines that contain one of these come here; everything else takes the path above.
+_AT_NAME = re.compile(r"@([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\Z")
+_CAPTURE = re.compile(r"([A-Za-z_]\w*)=@(.*)\Z", re.S)
+_ENV_WORD = re.compile(r"[A-Za-z_]\w*=")
+
+def lines(stream):
+    """`... | files=@lines`: the lines of a stream, without newlines."""
+    return stream.read().splitlines()
+
+class _Node:
+    """One stage.  kind: cmd (a program), call (Python), data (a value as a source), tap (capture / @tee)."""
+    def __init__(self, stage, kind, **kw):
+        self.stage, self.kind = stage, kind
+        self.argv, self.env, self.fn, self.args, self.value = [], {}, None, [], None
+        self.name = None                 # variable to assign
+        self.show = False                # tap: also display
+        self.source = False              # call without a stream
+        self.label = ""
+        self.__dict__.update(kw)
+        self.proc, self.thread, self.status, self.data = None, None, 0, None
+        self.assigned_ok = False
+
+def _env_words(stage, capture_context):
+    """split leading NAME=value words off a stage -> (env, remaining words)"""
+    words, env = list(stage.words), {}
+    while words and words[0] and words[0][0][0] == "lit" and _ENV_WORD.match(words[0][0][1]):
+        if capture_context and _is_capture_word(words[0]): break
+        k, _, v = words[0][0][1].partition("=")
+        words[0] = [("lit", v)] + words[0][1:] if (v or len(words[0]) > 1) else [("sq", "")]
+        env[k] = expand_assignment(words[0])
+        words.pop(0)
+    return env, words
+
+def _is_capture_word(w):
+    """an unquoted `name=@`, `name=@dotted` or `name=@(expr)`"""
+    if w[0][0] != "lit": return False
+    if len(w) == 1: return bool(_CAPTURE.match(w[0][1]))
+    return len(w) == 2 and w[1][0] == "py" and re.fullmatch(r"[A-Za-z_]\w*=", w[0][1]) is not None
+
+def _has_input(stage): return any(fd == 0 and mode in ("<", "heredoc", "herestr") for fd, mode, _ in stage.redirs)
+def _has_output(stage): return any(mode in (">", ">>") and fd in (1, "both") for fd, mode, _ in stage.redirs)
+
+def _evaluate(expr):
+    """eval a stage's `@(expr)`.  A lambda written there must see the caller's locals, and eval() gives it no
+    closure, so inside a function the locals are merged into the globals it gets."""
+    g, l = _scope()
+    return eval(expr, g if l is g else {**g, **l})
+
+def _lookup(name):
+    g, l = _scope()
+    first, *rest = name.split(".")
+    if first in l: obj = l[first]
+    elif first in g: obj = g[first]
+    elif hasattr(builtins, first): obj = getattr(builtins, first)
+    else: raise NameError(f"name '{first}' is not defined (import it first?)")
+    for part in rest: obj = getattr(obj, part)
+    return obj
+
+def _words(words):
+    out = []
+    for w in words: out.extend(expand_word(w))
+    return out
+
+def plan_stages(pipe):
+    """-> list of _Node if the pipeline involves Python or captures, else None.  `@(expr)` that turns out not
+    to be a stage is rewritten in place to the words it splices to, so it is evaluated exactly once."""
+    def interesting(st, i):
+        words = st.words
+        ctx = i > 0 or _has_input(st)
+        k = 0
+        while k < len(words) and words[k] and words[k][0][0] == "lit" and _ENV_WORD.match(words[k][0][1]):
+            if ctx and _is_capture_word(words[k]): return True
+            k += 1
+        if k >= len(words): return False
+        w = words[k]
+        if len(w) != 1: return False
+        kind, text = w[0]
+        if kind == "lit": return bool(_AT_NAME.match(text))
+        return kind == "py" and (len(pipe) > 1 or bool(st.redirs))
+    if not any(interesting(st, i) for i, st in enumerate(pipe)): return None
+
+    nodes, special = [], False
+    for i, st in enumerate(pipe):
+        last, ctx = i == len(pipe) - 1, i > 0 or _has_input(st)
+        env, words = _env_words(st, ctx)
+        if not words:
+            if env and len(pipe) == 1: return None
+            raise SyntaxError("empty command")
+        w = words[0]
+        first_kind, first_text = w[0]
+        if ctx and _is_capture_word(w):
+            if len(w) == 1: name, spec = _CAPTURE.match(first_text).groups()
+            else: name, spec = first_text[:-1], None
+            if name in KW or keyword.iskeyword(name): raise SyntaxError(f"cannot assign to {name}")
+            if spec in ("", "tee"):
+                if len(words) > 1: raise SyntaxError(f"{name}=@{spec} takes no arguments")
+                nodes.append(_Node(st, "tap", name=name, show=spec == "tee", env=env))
+            else:
+                if not last: raise SyntaxError(f"{name}=@function must be the last stage")
+                if spec is None: fn, label = _evaluate(w[1][1]), f"@({w[1][1]})"
+                else:
+                    if not _AT_NAME.match("@" + spec): raise SyntaxError(f"bad function name @{spec} (use @(...) for an expression)")
+                    fn, label = _lookup(spec), "@" + spec
+                if not callable(fn): raise TypeError(f"{label} is not callable")
+                nodes.append(_Node(st, "call", name=name, fn=fn, label=label, args=_words(words[1:]), env=env))
+            special = True
+            continue
+        single = len(w) == 1
+        if single and first_kind == "lit" and first_text == "@tee":
+            if len(words) > 1: raise SyntaxError("@tee takes no arguments")
+            nodes.append(_Node(st, "tap", show=True, env=env)); special = True
+            continue
+        at = _AT_NAME.match(first_text) if single and first_kind == "lit" else None
+        if at or (single and first_kind == "py" and (len(pipe) > 1 or st.redirs)):
+            obj = _lookup(at.group(1)) if at else _evaluate(first_text)
+            label = first_text if at else f"@({first_text})"
+            source = i == 0 and not _has_input(st)
+            if callable(obj):
+                nodes.append(_Node(st, "call", fn=obj, label=label, args=_words(words[1:]), source=source, env=env))
+                special = True
+                continue
+            feeds = len(pipe) > 1 or _has_output(st)
+            if source and len(words) == 1 and (at or feeds):
+                nodes.append(_Node(st, "data", value=obj, label=label, env=env)); special = True
+                continue
+            if at: raise TypeError(f"{label} is not callable")
+            values = obj if isinstance(obj, (list, tuple, set)) else [obj]              # splice, as before
+            words = [[("sq", str(v))] for v in values] + words[1:]
+        argv = _words(words)
+        if not argv: raise SyntaxError("empty command")
+        st.words = [[("sq", a)] for a in argv]                      # already expanded: don't do it twice
+        nodes.append(_Node(st, "cmd", argv=argv, env=env, label=argv[0]))
+    if not special:
+        for n, st in zip(nodes, pipe):                              # put NAME=value words back for the usual path
+            st.words = [[("lit", f"{k}="), ("sq", v)] for k, v in n.env.items()] + st.words
+        return None
+    for node in nodes:                                             # builtins and function aliases are Python too
+        if node.kind == "cmd" and (node.argv[0] in BUILTINS or callable(aliases.get(node.argv[0]))):
+            node.kind, node.fn = "builtin", BUILTINS.get(node.argv[0]) or aliases[node.argv[0]]
+            node.source = node is nodes[0] and not _has_input(node.stage)          # nothing to read: leave stdin alone
+    return nodes
+
+def _write_result(value, out):
+    """Put what a stage returned on its output.  -> the value to keep (iterators become lists)."""
+    def text(item):
+        return item.decode(errors="replace") if isinstance(item, (bytes, bytearray)) else item if isinstance(item, str) else str(item)
+    if value is None: return None
+    if isinstance(value, (str, bytes, bytearray)): out.write(text(value))
+    elif isinstance(value, (list, tuple, collections.abc.Iterator)):
+        streaming, seen = isinstance(value, collections.abc.Iterator), []
+        for item in value:
+            s = text(item)
+            out.write(s if s.endswith("\n") else s + "\n")
+            if streaming:
+                out.flush()
+                if out.keeps: seen.append(item)
+        if streaming: return seen if out.keeps else None       # consumed and not remembered: nothing to hand back
+        return value
+    else:
+        s = str(value); out.write(s if s.endswith("\n") else s + "\n")
+    return value
+
+class _Out:
+    """A stage's output stream; `keeps` says whether items of an iterator must be remembered."""
+    def __init__(self, stream, keeps=False): self.stream, self.keeps = stream, keeps
+    def write(self, s): return self.stream.write(s)
+    def flush(self): self.stream.flush()
+
+def _text_reader(fd):
+    return io.TextIOWrapper(os.fdopen(fd, "rb"), encoding="utf-8", errors="replace", newline="\n")
+
+def _call_hint(node, e):
+    name = getattr(node.fn, "__name__", "")
+    if isinstance(e, TypeError) and name.endswith("loads") and node.label.endswith("loads"):
+        sh_error(f"hint: did you mean {node.label[:-1]}? The function gets a stream, not a string.")
+
+def _run_function(node, in_fd, out):
+    """Call a stage's function.  -> (status, value).  `in_fd` is consumed."""
+    stream = _text_reader(in_fd) if in_fd is not None and not node.source else None
+    if in_fd is not None and stream is None: os.close(in_fd)
+    saved = {k: os.environ.get(k) for k in node.env}
+    os.environ.update(node.env)
+    try:
+        with contextlib.redirect_stdout(out.stream):
+            if node.kind == "builtin":
+                text = stream.read() if stream else None
+                rc, produced = run_inproc(lambda: node.fn(node.argv[1:]), True, text)
+                out.write(produced or ""); return rc, None
+            if node.kind == "data": value = node.value
+            else: value = node.fn(*([] if stream is None else [stream]), *node.args)
+            if node.name:
+                if isinstance(value, collections.abc.Iterator): value = list(value)    # while the input is still open
+                return 0, value
+            return 0, _write_result(value, out)
+    except (SystemExit, KeyboardInterrupt): raise
+    except BrokenPipeError: raise
+    except Exception as e:
+        traceback.print_exception(type(e), e, e.__traceback__.tb_next)
+        _call_hint(node, e)
+        return 1, None
+    finally:
+        for k, v in saved.items():
+            if v is None: os.environ.pop(k, None)
+            else: os.environ[k] = v
+        if stream is not None:
+            try: stream.close()                        # a writer upstream now gets SIGPIPE
+            except OSError: pass
+
+class _ForkProc:
+    """A forked Python stage, with enough of Popen's interface for jobs, waiting and ![...]."""
+    def __init__(self, pid): self.pid, self.returncode, self.stdout, self.stderr = pid, None, None, None
+    def _reap(self, flags):
+        if self.returncode is None:
+            try: pid, status = os.waitpid(self.pid, flags)
+            except ChildProcessError: self.returncode = 0; return self.returncode
+            if pid: self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+    def poll(self): return self._reap(os.WNOHANG)
+    def wait(self, timeout=None):
+        if timeout is None: return self._reap(0)
+        end = time.time() + timeout
+        while self.poll() is None:
+            if time.time() >= end: raise subprocess.TimeoutExpired("python stage", timeout)
+            time.sleep(0.01)
+        return self.returncode
+    def send_signal(self, s):
+        if self.returncode is None: os.kill(self.pid, s)
+    def terminate(self): self.send_signal(signal.SIGTERM)
+    def kill(self): self.send_signal(signal.SIGKILL)
+
+def _fd(x): return x if x is None or isinstance(x, int) else x.fileno()
+
+def _fork_stage(node, fds, others, pgid, foreground):
+    """Run a Python stage in a child.  fds = (in, out, err), None to inherit; `others` are pipe ends to close."""
+    sys.stdout.flush(); sys.stderr.flush()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)           # "fork() in a multi-threaded process"
+        pid = os.fork()
+    if pid: return _ForkProc(pid)
+    status = 1
+    try:
+        global INTERACTIVE
+        if pgid is not None:
+            try: os.setpgid(0, pgid)
+            except OSError: pass
+            if foreground and pgid == 0:
+                try: os.tcsetpgrp(0, os.getpgrp())
+                except OSError: pass
+        for s in (signal.SIGINT, signal.SIGTERM, signal.SIGQUIT): signal.signal(s, signal.SIG_DFL)
+        if INTERACTIVE:
+            for s in (signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU): signal.signal(s, signal.SIG_DFL)
+        INTERACTIVE = False; jobs.clear()
+        for target, source in enumerate(fds):
+            if source is not None and source != target: os.dup2(source, target)
+        for fd in set(others) | {f for f in fds if f is not None}:
+            if fd > 2:
+                try: os.close(fd)
+                except OSError: pass
+        sys.stdin = open(0, "r", errors="replace", closefd=False)
+        sys.stdout = open(1, "w", errors="replace", closefd=False, buffering=1 if os.isatty(1) else -1)
+        sys.stderr = open(2, "w", errors="replace", closefd=False, buffering=1)
+        try:
+            in_fd = None if node.source or node.kind == "data" else os.dup(0)
+            status, _ = _run_function(node, in_fd, _Out(sys.stdout))
+            sys.stdout.flush()
+        except BrokenPipeError: status = 128 + signal.SIGPIPE
+        except SystemExit as e: status = exit_status(e)
+        except KeyboardInterrupt: status = 130
+        try: sys.stderr.flush()
+        except OSError: pass
+    finally:
+        os._exit(status)                                # never return into the shell's own code
+
+def _tap(node, in_fd, out_fd, show_fd):
+    """The shell copies a stage's data, keeping it (and showing it): name=@, name=@tee, @tee."""
+    chunks = []
+    def write(fd, data):
+        view = memoryview(data)
+        while view: view = view[os.write(fd, view):]
+    try:
+        while True:
+            chunk = os.read(in_fd, 65536)
+            if not chunk: break
+            if node.name: chunks.append(chunk)
+            if show_fd is not None:
+                try: write(show_fd, chunk)
+                except OSError: show_fd = None
+            if out_fd is not None: write(out_fd, chunk)
+    except BrokenPipeError: node.status = 128 + signal.SIGPIPE        # the next stage stopped reading
+    except OSError as e: node.status = 1; sh_error(f"pipeline: {e.strerror}")
+    finally:
+        node.data = b"".join(chunks)
+        for fd in (in_fd, out_fd):
+            if fd is not None:
+                try: os.close(fd)
+                except OSError: pass
+
+def _judge(nodes):
+    """Assign the captured variables that earned it.  -> (status, no_match)."""
+    allowed = {os.path.basename(c) for c in ns.get("no_match_commands", ())}
+    failed, no_match, empty_ok, assigned = None, False, False, False
+    for node in nodes:
+        if node.name:
+            assigned = True
+            ok = failed is None and (node.kind == "tap" or node.status == 0)
+            if ok:
+                ns[node.name] = node.value if node.kind == "call" else node.data.decode("utf-8", "replace")
+                if no_match: empty_ok = True
+            elif failed is not None:
+                sh_error(f"{node.name} not assigned: {failed[0]} exited with status {failed[1]}")
+            else: sh_error(f"{node.name} not assigned: {node.label} failed")
+        s = node.status
+        if s == 128 + signal.SIGPIPE: continue                      # a later stage stopped reading
+        if s == 1 and node.kind == "cmd" and os.path.basename(node.argv[0]) in allowed: no_match = True; continue
+        if s != 0 and failed is None: failed = (node.label or "a stage", s)
+    last = nodes[-1].status
+    if not assigned: return _pipe_status([n.status for n in nodes]), False
+    if failed is not None: return failed[1], False
+    if last: return last, False
+    return (1, True) if empty_ok else (0, False)
+
+def run_python_pipeline(nodes, capture, capture_err, background, cmdline, tee, stream, timeout, merge):
+    t0 = time.time()
+    captures = any(n.kind == "tap" or n.name for n in nodes)
+    if captures and (background or stream):
+        raise SyntaxError("captures and name=@... can't be used with & or ![...]")
+    final = nodes[-1]
+    # The last stage stays in the shell if it is Python or a capture, unless the shell must not block on it.
+    here = final.kind != "cmd" and not background and not stream and not (final.kind == "data")
+    threads_needed = any(n.kind == "tap" for n in nodes[:-1])
+    use_jobs = background or (INTERACTIVE and not capture and not capture_err and not stream and not tee
+                              and not here and not threads_needed)
+    pipes, close_files, plumbing = [], [], []
+    pgid, live, taps = None, [], []
+
+    def new_pipe():
+        r, w = os.pipe(); pipes.extend((r, w)); return r, w
+
+    try:
+        incoming, stream_out = None, None
+        for i, node in enumerate(nodes):                 # first lay out every stage's descriptors
+            last = i == len(nodes) - 1
+            rin, rout, rerr, c = open_redirs(node.stage, node.env); close_files += c
+            stdin = _fd(rin) if rin is not None else incoming
+            if incoming is not None and rin is not None: os.close(incoming); pipes.remove(incoming)
+            stdout, nxt = _fd(rout), None
+            if not last:
+                nxt, w = new_pipe()
+                if stdout is None: stdout = w
+                else: os.close(w); pipes.remove(w)       # output redirected: the next stage reads nothing
+            elif stream and stdout is None:
+                r, stdout = new_pipe(); stream_out = r
+            stderr = stdout if rerr == subprocess.STDOUT else _fd(rerr)
+            if node.stage.merge_err or (merge and last): stderr = stdout
+            plumbing.append((node, stdin, stdout, stderr, last))
+            incoming = nxt
+
+        for node, stdin, stdout, stderr, last in plumbing:          # processes first, threads afterwards
+            group = (0 if pgid is None else pgid) if (use_jobs or timeout) else None
+            if node.kind == "tap" or (last and here): continue
+            if stdin is None and background and not INTERACTIVE:
+                stdin = os.open(os.devnull, os.O_RDONLY); pipes.append(stdin)
+            if node.kind == "cmd":
+                out_arg = stdout if stdout is not None else (subprocess.PIPE if (last and (capture or tee)) else None)
+                err_arg = stderr if stderr is not None else (subprocess.PIPE if ((capture_err or tee) and last) else None)
+                kw = {}
+                if group is not None:
+                    kw["process_group"] = group
+                    if use_jobs: kw["preexec_fn"] = _child_setup_fg if (INTERACTIVE and not background) else _child_setup_bg if INTERACTIVE else None
+                try:
+                    node.proc = subprocess.Popen(node.argv, stdin=stdin, stdout=out_arg, stderr=err_arg,
+                                                 env={**os.environ, **node.env} if node.env else None, **kw)
+                except (FileNotFoundError, PermissionError) as e:
+                    sh_error(f"{node.argv[0]}: {'command not found' if isinstance(e, FileNotFoundError) else 'permission denied'}")
+                    if INTERACTIVE and not background: _tty(os.tcsetpgrp, 0, SHELL_PGID)
+                    node.status = 127
+            else:
+                node.proc = _fork_stage(node, (stdin, stdout, stderr), pipes, group, use_jobs and INTERACTIVE and not background)
+            if node.proc is not None:
+                live.append(node)
+                if group is not None:
+                    if pgid is None: pgid = node.proc.pid
+                    try: os.setpgid(node.proc.pid, pgid)
+                    except OSError: pass
+
+        # the shell keeps only the descriptors its own threads and last stage will use
+        keep = set()
+        for node, stdin, stdout, stderr, last in plumbing:
+            if node.kind == "tap":
+                copy_out = os.dup(stdout) if stdout is not None else None
+                copy_in = os.dup(stdin) if stdin is not None else os.dup(0)
+                taps.append((node, copy_in, copy_out, last))
+            elif last and here and stdin is not None:
+                keep.add(os.dup(stdin))
+        final_in = next(iter(keep), None)
+        final_out, final_err = plumbing[-1][2], plumbing[-1][3]
+        final_out = os.dup(final_out) if here and final_out is not None else None
+        final_err = os.dup(final_err) if here and final_err is not None else None
+        if stream_out is not None: stream_out = os.dup(stream_out)
+        for fd in pipes: os.close(fd)
+        pipes = []
+
+        if stream:
+            if final.proc is not None: final.proc.stdout = os.fdopen(stream_out, "rb")
+            procs = [n.proc for n in nodes]
+            return Process(procs, cmdline, timeout, None, None if nodes[-1].proc else nodes[-1].status, pgid=pgid)
+        killer = _Killer(timeout, [n.proc.pid for n in live], pgid) if timeout and live else None
+
+        if use_jobs:
+            if not live: return Result(final.status, None, None, time.time() - t0, cmdline)
+            job = Job([n.proc.pid for n in live], pgid, cmdline)
+            for n in live: n.proc.returncode = 0
+            if background:
+                add_job(job)
+                if INTERACTIVE: print(f"[{job.id}] {job.pids[-1]}")
+                return Result(0, None, None, 0, cmdline)
+            rc = run_foreground(job)
+            if final.proc is None: rc = final.status
+            res = Result(rc, None, None, time.time() - t0, cmdline)
+            if killer: killer.cancel(); res.timed_out = killer.fired
+            return res
+
+        out_buf = io.StringIO() if capture else None
+        err_buf = io.StringIO() if capture_err else None
+        sys.stdout.flush()
+        shown_file = None
+        for node, copy_in, copy_out, last in taps:
+            if not last:                                  # a middle capture passes data on while we get on with the rest
+                node.thread = threading.Thread(target=_tap, args=(node, copy_in, copy_out, 1 if node.show else None), daemon=True)
+                node.thread.start()
+                continue
+            display = None                                # the last stage is a capture: copy right here
+            if node.show and copy_out is None:
+                if capture: shown_file = tempfile.TemporaryFile(); display = shown_file.fileno()
+                else: display = 1
+            _tap(node, copy_in, copy_out, display)
+            if shown_file is not None:
+                shown_file.seek(0); out_buf.write(shown_file.read().decode("utf-8", "replace")); shown_file.close()
+
+        value = None
+        if here and final.kind != "tap":
+            sink = open(final_out, "w", errors="replace") if final_out is not None else None
+            target = sink or out_buf or sys.stdout
+            errors = open(final_err, "w", errors="replace") if final_err is not None and final_err != final_out else None
+            try:
+                err_target = errors or (sink if final_err is not None else None) or err_buf or sys.stderr
+                with contextlib.redirect_stderr(err_target):
+                    try: final.status, value = _run_function(final, final_in, _Out(target, keeps=capture))
+                    except BrokenPipeError: final.status = 128 + signal.SIGPIPE
+                target.flush()
+            finally:
+                for f in (sink, errors):
+                    if f is not None:
+                        try: f.close()
+                        except OSError: pass
+            final.value = value
+
+        out = err = None
+        for node in nodes:                                # wait for everything else
+            if node.proc is not None:
+                while True:
+                    try:
+                        if node is final and (capture or capture_err or tee):
+                            out, err = _collect(node.proc, tee)
+                        else: node.proc.wait()
+                        break
+                    except KeyboardInterrupt: pass
+                node.status = _status(node.proc.returncode)
+            if node.thread is not None: node.thread.join()
+        status, no_match = _judge(nodes)
+        if capture and out_buf is not None and final.kind != "cmd": out = out_buf.getvalue()
+        if err_buf is not None and final.kind != "cmd": err = err_buf.getvalue()
+        res = Result(status, out, err, time.time() - t0, cmdline)
+        res.no_match = no_match
+        res.value = value
+        if killer: killer.cancel(); res.timed_out = killer.fired
+        if final.kind == "call" and not final.name and value is not None and _at_prompt and not capture and not tee \
+                and not isinstance(value, collections.abc.Iterator) and not (isinstance(value, list) and not value and final.status):
+            builtins._ = value
+        return res
+    except KeyboardInterrupt:
+        for n in nodes:
+            if n.proc is not None:
+                try: n.proc.wait(2)
+                except (subprocess.TimeoutExpired, KeyboardInterrupt): n.proc.kill(); n.proc.wait()
+        raise
+    finally:
+        for fd in pipes:
+            try: os.close(fd)
+            except OSError: pass
+        for f in close_files: f.close()
 
 def run_shell(line, capture=False, capture_err=False, tee=False, stream=False, timeout=None, merge=False):
     global last
@@ -1235,8 +1750,11 @@ def run_shell(line, capture=False, capture_err=False, tee=False, stream=False, t
         except SyntaxError as e: sh_error(f"syntax error: {e}"); res = Result(2, cmd=line)
         except OSError as e: sh_error(str(e)); res = Result(1, cmd=line)
         except ArithmeticError as e: sh_error(str(e)); res = Result(1, cmd=line)
+        except (SystemExit, KeyboardInterrupt): raise
+        except Exception as e:                       # evaluating @name / @(expr) failed
+            sh_error(f"{type(e).__name__}: {e}"); res = Result(1, cmd=line)
         _setlast(res)
-        if _errexit and res.returncode != 0 and term not in ("&&", "||", "&"): raise SystemExit(res.returncode)
+        if _errexit and res.returncode != 0 and not res.no_match and term not in ("&&", "||", "&"): raise SystemExit(res.returncode)
         if term in ("&&", "||"): skip_until = term
     return res
 
@@ -1313,6 +1831,9 @@ ns.update(shell=shell, last=last, __arith__=arith, __env__=_Env(), aliases=alias
           __live__=_scoped(lambda c: sh(c, capture=False)),
           sh=_scoped(sh), ShellError=ShellError, Process=Process)
 ns["__doc__"] = None
+ns["lines"] = lines
+ns["set_pipefail"] = False                       # True: a pipeline fails if any stage does, not only the last
+ns["no_match_commands"] = {"grep", "egrep", "fgrep", "zgrep", "rg", "ag", "pgrep"}   # exit 1 means "found nothing"
 ns["import_cwd"] = True                          # `import` finds modules in the current directory (or a script's own directory); False disables
 ns["probe_flags"] = True                         # Tab on a -flag runs `cmd --help` for system programs; False disables
 ns["complete_ignore_dirs"] = ("/mnt/c",)   # PATH directories hidden from command completion
@@ -1321,13 +1842,38 @@ ns["complete_ignore"] = (".dll", ".exe", ".vbs", ".efi", ".mof", ".bat", ".drv",
 KW = {"def", "class", "if", "elif", "else", "for", "while", "with", "try", "except", "finally", "import",
       "from", "async", "return", "raise", "del", "assert", "global", "nonlocal", "pass", "lambda", "yield", "match", "await"}
 
+def _has_pipe_or_redirect(s):
+    """a `|`, `<` or `>` outside quotes, brackets and comments"""
+    depth, i, n = 0, 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in "'\"":
+            j = i + 1
+            while j < n and s[j] != c: j += 2 if s[j] == "\\" else 1
+            i = j
+        elif c in "([{": depth += 1
+        elif c in ")]}": depth -= 1
+        elif c == "#": break
+        elif c in "|<>" and depth <= 0: return True
+        i += 1
+    return False
+
+def _splice_with_words(s):
+    """`@(editor) file.txt`: words after `@(...)` can't be a decorator, so it is a command"""
+    if not s.startswith("@("): return False
+    try: rest = s[match_paren(s, 1):]
+    except SyntaxError: return False
+    return bool(rest[:1].isspace() and rest.strip() and not rest.strip().startswith(("#", ".", "(", "[")))
+
 def classify(line):
     s = line.strip()
     m = re.match(r"[^\s|&;<>()=]+", s)
     w = m.group() if m else ""
     if s.startswith("%"): return "sh"                  # `% cmd`: shell, whatever it looks like
     kw = re.match(r"[A-Za-z_]\w*", s)
-    if (kw and kw.group() in KW and not (kw.group() in BUILTINS)) or s.startswith("@"): return "py"
+    if s.startswith("@"):                                          # `@rows | sort` is a pipeline, else a decorator
+        return "sh" if _has_pipe_or_redirect(s) or _splice_with_words(s) else "py"
+    if kw and kw.group() in KW and not (kw.group() in BUILTINS): return "py"
     if w in BUILTINS and w not in ns and not s[len(w):].lstrip().startswith(("(", "=", ".", "[")): return "sh"
     try: py = preprocess(s)
     except SyntaxError: return "sh"                    # e.g. an unbalanced $( : the shell parser reports it
@@ -1823,6 +2369,8 @@ del _ls
 # import_cwd = True                   # `import` finds modules in the current directory
 # complete_ignore = (".dll", ".exe", ".vbs", ".efi", ".mof", ".bat", ".drv", ".sys", ".tlb", ".xml")
 # complete_ignore_dirs = ("/mnt/c",)  # PATH directories left out of command completion
+# set_pipefail = False                # True: a pipeline fails if any of its stages does
+# no_match_commands |= {"mytool"}     # more commands whose exit status 1 means "found nothing" (for | x=@...)
 
 # The prompt. Fields: {venv} {user} {host} {cwd} {branch} {status}
 # Colours: {red} {green} {yellow} {blue} {magenta} {cyan} {white} {grey} {bold} {reset}
@@ -1871,6 +2419,7 @@ def run_rc(create=True):
         _setlast(Result())                             # a failing line in the rc file shouldn't mark the first prompt
 
 def repl(interactive=False, norc=False):
+    global _at_prompt
     tty = os.isatty(0) and os.isatty(1)
     global _exit_warned
     if tty:
@@ -1897,6 +2446,7 @@ def repl(interactive=False, norc=False):
         if not line.strip(): continue
         if tty: save_history(line)
         _exit_warned = False if not line.strip().startswith(("exit", "quit")) else _exit_warned
+        _at_prompt = True
         try: run_block(line) if isinstance(line, Block) else run_line(line)
         except SystemExit as e: hup_jobs(); return exit_status(e)
         except KeyboardInterrupt: print()

@@ -1,5 +1,5 @@
 """The scripts in examples/: each has the right shebang, answers --help, and does its job."""
-import glob, importlib.util, os, socket, subprocess, sys, tempfile, threading, unittest
+import glob, importlib.util, os, shutil, socket, subprocess, sys, tempfile, threading, unittest
 
 from helpers import PYSH, ROOT
 
@@ -36,7 +36,7 @@ def git(cwd, *args):
 
 class Every(unittest.TestCase):
     def test_there_are_examples(self):
-        self.assertGreaterEqual(len(SCRIPTS), 15)
+        self.assertGreaterEqual(len(SCRIPTS), 18)
 
     def test_shebang_and_executable(self):
         for p in SCRIPTS:
@@ -504,6 +504,73 @@ class GpuBench(unittest.TestCase):
         r = example("gpubench.sh", "-n", "100000", timeout=180)
         self.assertEqual(r.returncode, 1); self.assertIn("GPU memory", r.stderr)
         self.assertNotIn("Traceback", r.stderr)
+
+
+class LogWatch(unittest.TestCase):
+    def log(self, text):
+        with tempfile.NamedTemporaryFile("w", delete=False) as f: f.write(text)
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_demo(self):
+        r = example("logwatch.sh", "-n", "20")
+        self.assertEqual(r.returncode, 0, r.all)
+        self.assertRegex(r.stdout, r"-- 20 lines: ERROR \d+")
+
+    def test_file_with_filters_and_hostile_text(self):
+        path = self.log("INFO ok\nERROR disk full\nWARN disk slow\nDEBUG disk\n\x1b]0;pwned\x07 ERROR other\n")
+        r = example("logwatch.sh", path, "-p", "DISK", "-l", "WARN")
+        self.assertEqual(r.stdout, "ERROR disk full\nWARN disk slow\n-- 2 lines: ERROR 1  WARN 1\n", r.all)
+        r = example("logwatch.sh", path)
+        self.assertNotIn("\x1b]0;pwned", r.stdout)
+
+    def test_bad_arguments(self):
+        self.assertEqual(example("logwatch.sh", "/no/such/log").returncode, 1)
+        self.assertEqual(example("logwatch.sh", "-p", "(").returncode, 2)
+
+
+@unittest.skipUnless(shutil.which("curl"), "needs curl")
+class ApiPeek(unittest.TestCase):
+    def test_sample(self):
+        r = example("apipeek.sh")
+        self.assertEqual(r.returncode, 0, r.all)
+        for word in ("object with 5 keys", "items: list of 3", 'name: "alpha"'): self.assertIn(word, r.stdout)
+        self.assertEqual(example("apipeek.sh", "--path", "items.2.tags").stdout.split(), ["[", '"a",', '"b"', "]"])
+        r = example("apipeek.sh", "--path", "items.9")
+        self.assertEqual(r.returncode, 1); self.assertIn("no '9'", r.stderr)
+
+    def test_failed_fetch_and_non_json_reply(self):
+        r = example("apipeek.sh", "file:///no/such/file")
+        self.assertEqual(r.returncode, 1, r.all)
+        self.assertIn("could not fetch", r.stderr); self.assertNotIn("Traceback", r.stderr)
+        with tempfile.NamedTemporaryFile("w", delete=False) as f: f.write("<html>\x1b[31mno")
+        self.addCleanup(os.unlink, f.name)
+        r = example("apipeek.sh", "file://" + f.name)
+        self.assertEqual(r.returncode, 1, r.all)
+        self.assertIn("not JSON", r.stderr); self.assertNotIn("\x1b[31m", r.all); self.assertNotIn("Traceback", r.stderr)
+
+    def test_only_url_schemes_that_make_sense(self):
+        for bad in ("ftp://x", "-K/etc/passwd", "example.com"):
+            with self.subTest(url=bad): self.assertEqual(example("apipeek.sh", "--", bad).returncode, 2)
+
+
+class Inventory(unittest.TestCase):
+    def test_report(self):
+        r = example("inventory.sh", "-n", "3")
+        self.assertEqual(r.returncode, 0, r.all)
+        for word in ("== inventory,", "== memory by user", "== biggest processes", "== fullest file systems"):
+            self.assertIn(word, r.stdout)
+
+    def test_find_with_and_without_matches(self):
+        r = example("inventory.sh", "--find", "PYSH")
+        self.assertEqual(r.returncode, 0, r.all)
+        self.assertRegex(r.stdout, r"processes matching 'PYSH': [1-9]")
+        r = example("inventory.sh", "--find", "no-such-process-zzz")
+        self.assertEqual(r.returncode, 0, r.all)
+        self.assertIn("matching 'no-such-process-zzz': 0", r.stdout)
+
+    def test_bad_top(self):
+        self.assertEqual(example("inventory.sh", "-n", "0").returncode, 2)
 
 
 @unittest.skipUnless(have("cupy"), "needs cupy")

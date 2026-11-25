@@ -1,6 +1,6 @@
 # pysh examples
 
-Fifteen working scripts that each mix shell commands and Python in one file. Every one starts with
+Eighteen working scripts that each mix shell commands and Python in one file. Every one starts with
 `#!/usr/local/bin/pysh`, takes `--help`, and runs with no arguments (or fails with a clear usage
 message, where it needs a target). They use only libraries that are already installed with the
 system Python: pandas, numpy, scipy, rich, psutil, networkx, cryptography, lxml, jinja2, pwntools,
@@ -25,7 +25,10 @@ If `pysh` isn't installed at `/usr/local/bin/pysh`, use the second form or edit 
 | `llm-commit.sh` | drafts a commit message from `git diff --staged` with a local Ollama model | `$(git …)`, `$[git commit -e …]` |
 | `portscan.sh` | connect scan, banners, nmap service detection, Markdown report | `!(nmap …)` + lxml + jinja2 |
 | `ropnotes.sh` | pwntools tour of an ELF: checksec, imports, cyclic patterns, asm/disasm | `$(file -b …)` + pwntools |
-| `gpubench.sh` | NumPy on the CPU vs CuPy on the GPU: matmul, FFT, sort, reduction, fused kernel; `--mandelbrot` draws a fractal | `!(nvidia-smi …)` facts, cupy, same-answer checks |
+| `gpubench.sh` | NumPy on the CPU vs CuPy on the GPU: matmul, FFT, sort, reduction, fused kernel; `--mandelbrot` draws a fractal | `!(nvidia-smi … \| @(csv.reader)).value`, cupy, same-answer checks |
+| `logwatch.sh` | follow a log, filter it, count by level | a pipeline made only of Python: `@source \| @matching \| @report` |
+| `apipeek.sh` | fetch JSON and describe its shape | `curl … \| raw=@ \| data=@as_json`, nothing assigned if the fetch fails |
+| `inventory.sh` | memory by user, biggest processes, full disks | `ps … \| procs=@parse_ps`, `@(rows) \| sort \| head`, `$[…]` inside a block |
 
 ## Things to know
 

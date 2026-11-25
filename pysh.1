@@ -116,6 +116,9 @@ Complete example scripts are in the
 .B examples/
 directory of the source tree.
 .SH PYTHON AND SHELL TOGETHER
+.PP
+Python functions can also be pipeline stages, and pipeline results can go into variables;
+see PYTHON IN PIPELINES.
 .TP
 .BI $( cmd )
 Run
@@ -329,6 +332,205 @@ send standard error into the stream.
 Inside a function,
 .BI @( expr )
 sees the function's local variables, and these calls work from threads.
+.SH PYTHON IN PIPELINES
+A pipeline stage can be Python.
+.PP
+.RS
+.nf
+import json
+curl \-sf $URL | data=@json.load
+ps aux | grep ssh | hits=@lines
+@(sorted(hits, key=len)) | head \-3
+.fi
+.RE
+.SS Stages
+.BI @ name
+(a dotted name) or
+.BI @( expression )
+written where a command would go makes that stage call a Python function.
+The function receives a text stream like
+.I sys.stdin
+(UTF\-8, undecodable bytes replaced), followed by any further words of the stage as string arguments:
+.PP
+.RS
+.nf
+def grep_re(stream, pattern):
+    return (l for l in stream if re.search(pattern, l))
+
+ps aux | @grep_re 'ssh|nginx'
+cat data.json | @json.load
+.fi
+.RE
+.PP
+Note
+.BR json.load ,
+which reads a stream, not
+.BR json.loads ,
+which wants a string.
+.PP
+What the function returns is written to the stage's output:
+.TP
+.B None
+Nothing; the function printed for itself.
+.B print()
+inside it goes to the stage's output.
+.TP
+.B str, bytes
+The text as is.
+.TP
+.B list, tuple, iterator
+One item per line.
+A generator is written as it produces, so
+.B "tail \-f log | @errors | head"
+streams.
+.TP
+Anything else
+Its printed form.
+.PP
+.BI @( expression )
+is a stage only when its value is callable; otherwise it is spliced into the command line as usual,
+so
+.B "ls | @(cmd) \-l"
+runs the program named by
+.IR cmd .
+Redirections, here\-documents and here\-strings apply to Python stages as to programs.
+Quoted or escaped words
+.RB ( '@x' ", " \e@x )
+are ordinary words.
+Function aliases and builtins keep working in pipelines.
+.PP
+A function that raises prints its traceback and gives status 1.
+.SS Capture and assignment
+.TP
+.IB name =@
+Keep the raw text that passes this point, trailing newline included.
+Allowed anywhere in a pipeline; silent when last.
+.TP
+.IB name =@tee
+The same, also showing the data as it arrives.
+.TP
+.B @tee
+Show the data and pass it on without keeping it.
+A middle
+.B @tee
+writes to the shell's standard output.
+.TP
+.IB name =@ function
+Keep what the function returns; iterators become lists.
+Only in the last stage.
+The built\-in
+.B lines
+returns a stream's lines without newlines.
+.PP
+.RS
+.nf
+curl \-sf $URL | raw=@tee | data=@json.load
+ps aux | all=@ | grep ssh | hits=@lines
+date | today=@
+data=@json.load < config.json
+.fi
+.RE
+.PP
+The names are Python variables in the session, not environment variables, even when assigned from
+.B sh()
+inside a function.
+.IB name =@ function
+is an assignment when it follows
+.B |
+or has input redirected; otherwise
+.B "X=@y command"
+remains an environment assignment, as does any quoted value.
+Nothing is printed.
+.SS When variables are left unchanged
+A variable keeps its old value if any command before the capture fails, or if its function raises.
+The pipeline's status is then non\-zero and a message names the variable.
+A failure after a capture does not undo it.
+Use
+.B "curl \-f"
+so that an HTTP error counts as a failure.
+A command ended by SIGPIPE because a later stage stopped reading is not a failure.
+.PP
+Exit status 1 from a command named in
+.B no_match_commands
+(grep, egrep, fgrep, zgrep, rg, ag, pgrep) means nothing was found.
+The variable is assigned the empty value
+.RB ( [] " from " @lines ", an empty string from " name=@ ),
+the status stays 1 so that
+.B &&
+and
+.B ||
+behave as with grep itself, and
+.B \-e
+does not stop the script.
+.B "sh(..., check=True)"
+still raises.
+A wrapper such as
+.B sudo grep
+hides the command, so the variable is left unchanged.
+.SS Pipeline status
+A pipeline's status is that of its last stage; with captures, a failure before them makes it non\-zero too.
+With
+.B set_pipefail = True
+any stage's failure is reported (the last one, if several), for all pipelines;
+a stage ended by SIGPIPE does not count.
+.SS Python as the source
+The first stage may be Python.
+With no input redirection, a function is called with only the further words as arguments, and any other value
+is written out by the rules above:
+.PP
+.RS
+.nf
+@rows | sort
+@mygen 100 | head
+@(df.to_csv()) | wc \-l
+.fi
+.RE
+.PP
+A line that begins with
+.B @
+is a Python decorator unless it has a
+.BR | ", " <
+or
+.B >
+outside quotes and brackets, or words after
+.BR @( ... ) .
+.SS Returned values
+At the prompt, a value returned by the last stage and not assigned is also stored in
+.B _
+(iterators are consumed, not stored).
+.B "!( ... )"
+gives it as
+.BR .value :
+.PP
+.RS
+.nf
+r = !(cat data.json | @json.load)
+r.value
+.fi
+.RE
+.SS Scripts and functions
+Indented Python blocks hold Python only.
+Inside them write a pipeline as
+.B $[ ... ]
+(output on the terminal; captures set session variables) or
+.B !( ... )
+(captured).
+.SS Where stages run
+The last stage runs in the shell, so what it changes persists.
+Earlier Python stages run in forked copies of the shell: they stream, but their changes are lost,
+and they cannot use a GPU context the shell has already created.
+.PP
+A pipeline ending in Python or in a capture cannot be suspended with Ctrl\-Z; Ctrl\-C interrupts it.
+Captures cannot be used with
+.B &
+or
+.BR "![ ... ]" ,
+and hold their text in memory.
+A
+.B sh()
+timeout stops the programs but cannot interrupt Python running in the shell.
+.B @name
+is not completed or highlighted.
 .SH WORKING DIRECTORY
 .B $PWD
 always names the real working directory.
@@ -648,6 +850,18 @@ Set to
 in
 .I ~/.pyshrc
 to disable it for interactive sessions.
+.TP
+.B set_pipefail
+When
+.B True
+a pipeline fails if any of its stages does (default
+.BR False ).
+See PYTHON IN PIPELINES.
+.TP
+.B no_match_commands
+Set of command names whose exit status 1 means that nothing was found, for captures.
+Extend it with
+.BR "no_match_commands |= {\(dqmytool\(dq}" .
 .TP
 .B probe_flags
 Tab on a word starting with

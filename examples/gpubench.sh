@@ -7,7 +7,7 @@ table of times and speedups. `--mandelbrot` instead computes a fractal on both a
 your terminal. GPU facts come from `nvidia-smi`. Exits 1 if there is no usable CUDA GPU or a result
 differs.
 """
-import argparse, re, shutil, statistics, sys, time
+import argparse, csv, re, shutil, statistics, sys, time
 import numpy as np
 from rich.console import Console
 from rich.markup import escape
@@ -22,12 +22,10 @@ KERNELS = ("matmul", "fft", "sort", "sum", "fused")
 def gpu_facts():
     """one line per GPU from nvidia-smi, as dicts (empty if nvidia-smi is missing)"""
     if not shutil.which("nvidia-smi"): return []
-    r = !(nvidia-smi --query-gpu=name,memory.total,memory.used,temperature.gpu,utilization.gpu,driver_version --format=csv,noheader,nounits)
-    rows = []
-    for line in r.out.splitlines():
-        f = [x.strip() for x in line.split(",")]
-        if len(f) == 6: rows.append(dict(zip(("name", "total", "used", "temp", "util", "driver"), f)))
-    return rows
+    # a Python stage in the pipeline: csv does the parsing, and `.value` hands back the rows
+    r = !(nvidia-smi --query-gpu=name,memory.total,memory.used,temperature.gpu,utilization.gpu,driver_version --format=csv,noheader,nounits | @(lambda f: csv.reader(f, skipinitialspace=True)))
+    keys = ("name", "total", "used", "temp", "util", "driver")
+    return [dict(zip(keys, (x.strip() for x in row))) for row in r.value or [] if len(row) == len(keys)]
 
 def load_cupy():
     """-> cupy module, or exit 1 with a helpful message"""

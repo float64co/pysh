@@ -648,3 +648,27 @@ class ImportFromCwd(Base):
 
     def test_import_cwd_is_a_documented_setting(self):
         self.assertEqual(run("print(import_cwd)\n", mode="stdin").out.strip(), "True")
+
+
+class AssignmentExpansion(Base):
+    """`NAME=value` expands as in bash: no word splitting or globbing, `~` after `=` and `:`."""
+    def check(self, script, expected):
+        r = run(script, mode="stdin")
+        self.assertEqual(r.out.strip(), expected, msg=repr(r))
+
+    def test_export_does_not_split_variables(self):
+        self.check('export FLAGS="-a -b"\nexport OPTS=$FLAGS\nsh -c \'echo "[$OPTS]"\'\n', "[-a -b]")
+
+    def test_prefix_assignment_does_not_split(self):
+        self.check('export F="x  y"\nQ=$F sh -c \'echo "[$Q]"\'\n', "[x  y]")
+        self.check('W=$(printf "a  b") sh -c \'echo "[$W]"\'\n', "[a  b]")
+
+    def test_tilde_after_equals_and_colon(self):
+        home = tempfile.gettempdir()
+        self.check("export P=~/bin:~/x:/usr/bin\nsh -c 'echo $P'\n", f"{home}/bin:{home}/x:/usr/bin")
+
+    def test_no_globbing_or_braces_and_empty_value(self):
+        self.check("export G=*.zz{a,b}\nexport E=\nsh -c 'echo \"$G [$E]\"'\n", "*.zz{a,b} []")
+
+    def test_ordinary_arguments_are_unchanged(self):
+        self.check('export V="a b"\nprintf "<%s>" $V a=~/z\n', "<a><b><a=~/z>")

@@ -163,7 +163,7 @@ supports `--help`.
   Python attributes by type, flags parsed from `cmd --help`. Tab cycles, Enter runs the selection, Esc cancels.
 - **Pasting**: text that arrives in one go (a paste, or typing ahead while a command runs) is inserted in one step and repainted once, so large pastes are fast.
 - **`Ctrl-R`** history search menu; `↑`/`↓` search history by prefix.
-- **Colored `ls`**: interactive shells alias `ls` to `ls --color=auto` when your `ls` supports it (override in `~/.pyshrc.py`).
+- **Colored `ls`**: interactive shells alias `ls` to `ls --color=auto` when your `ls` supports it (set up by the starter `~/.pyshrc`; edit or delete it there).
 - **Prompt**: `user@host ~/src/c/pysh(branch)>`, with the git branch in white.
 
 ## Security notes
@@ -171,12 +171,12 @@ supports `--help`.
 - **Flag probing.** Tab on a `-flag` runs `<command> --help` to read the options. This is on by default but
   limited to system programs: found on an absolute `$PATH` entry, with the file, its directory and the `$PATH`
   entry owned by root and not group/world-writable. A relative path (`./tool`), a `.` or empty `$PATH` entry,
-  or a program in a directory you can write to is never run. Set `probe_flags = False` in `~/.pyshrc.py` to turn
+  or a program in a directory you can write to is never run. Set `probe_flags = False` in `~/.pyshrc` to turn
   it off.
 - **`import` searches the current directory**, as `python` does: in the REPL, `-c` and piped input the first
   `sys.path` entry is `''` (it follows `cd`), and a script file searches its own directory. That is what lets
   you `import` a Cython module or helper file sitting next to you, but it also means a hostile `json.py` or
-  `.so` in a directory you work in can be imported. Set `import_cwd = False` in `~/.pyshrc.py` to turn it
+  `.so` in a directory you work in can be imported. Set `import_cwd = False` in `~/.pyshrc` to turn it
   off for interactive sessions, or `PYSH_IMPORT_CWD=0` in the environment for `-c`, scripts and piped input.
 - **Completion never evaluates what you type.** Python attribute completion looks up plain dotted names only
   (no calls, no indexing, no properties).
@@ -189,7 +189,7 @@ supports `--help`.
   `$PATH` entries, so a `.` in `$PATH` can't run something from the current directory at startup.
 - **Arithmetic is 64-bit** like a real shell (`$((2**63))` wraps), and brace expansion refuses ranges over
   100,000 items or 1,000,000 words, so a script can't be made to hang or exhaust memory by one expression.
-- pysh is not setuid and runs with your privileges; `~/.pyshrc.py` is trusted code. Pasting text that contains
+- pysh is not setuid and runs with your privileges; `~/.pyshrc` is trusted code. Pasting text that contains
   newlines still runs it line by line (no bracketed paste yet), so be careful pasting from web pages.
 
 ## Tests
@@ -202,9 +202,62 @@ PYSH=./pysh-static python3 -m unittest discover -s tests -k Parser
 The line-editor and job-control tests run pysh on a pty and render its output with a small
 VT100 emulator (`tests/term.py`), so they check what a terminal would show, including wrapping.
 
+## Virtualenvs
+
+```
+activate            # ./.venv or ./venv
+activate ~/envs/ml  # or any virtualenv
+deactivate
+```
+
+`source .venv/bin/activate` does the same. Activating puts the venv's `bin` on `$PATH`, sets `$VIRTUAL_ENV`,
+and makes `import` in pysh use the venv's packages (and hide the system ones, unless the venv was made with
+`--system-site-packages`). Starting pysh inside an already activated venv does the same for `import`.
+
+- pysh embeds one Python. A venv made with a different minor version (3.11 against 3.12, say) still gets its
+  commands on `$PATH`, but `import` is left alone and pysh says so.
+- Names you already imported keep the old objects. Import again after switching.
+
+## Startup options
+
+`pysh -i` reads `~/.pyshrc`, also before `-c` or a script. `-l`/`--login` is accepted, as are combinations
+like `-lic`, so that `login`, `ssh`, tmux and editors can start pysh; no separate login file is read.
+`pysh --norc` skips `~/.pyshrc`. If a broken one keeps you out, run that from another shell.
+
 ## Configuration
 
-`~/.pyshrc.py` runs at startup in the shell's namespace:
+Every interactive pysh runs `~/.pyshrc`. If you don't have one, pysh writes a starter file the first time:
+it sets up coloured `ls` and lists the settings and a few examples, commented out. An existing file is never
+overwritten. Delete it to get a fresh copy. Mix shell and Python in it:
+
+```python
+export EDITOR=vim
+export PATH=~/bin:$PATH
+export TODAY=$(date +%F)
+alias ll='ls -l'
+import os
+if os.path.isdir(os.path.expanduser("~/go")):
+    os.environ["GOPATH"] = os.path.expanduser("~/go")
+```
+
+It takes the same syntax as a script file, and everything it defines at the top level stays in your
+session: imports, variables, functions, lambdas, classes and aliases. `__name__` is `"__main__"` while it
+runs, so don't paste in a script's `if __name__ == "__main__": sys.exit(main())` block; that would run it and
+leave the shell.
+
+Things to know about `~/.pyshrc`:
+
+- Environment variables need `export`. A bare `NAME=value` line is Python, as in any pysh script.
+- An indented Python block holds Python only. Set variables there with `os.environ[...]`, or run a shell
+  line with `$[export X=1]`.
+- An error is reported and the rest of the file still runs. `exit` leaves the shell, as in bash.
+- Only interactive shells read it. Scripts and `-c` inherit the environment of whatever started them.
+- It can't import modules from the current directory, whatever `import_cwd` says.
+- `source ~/.pyshrc` re-runs it.
+- pysh does not read `/etc/profile` or `~/.profile`. If it is your login shell, put anything you need from
+  them here.
+
+The settings:
 
 ```python
 aliases["ll"] = "ls -l"
@@ -212,8 +265,34 @@ complete_ignore = (".dll", ".exe")      # suffixes hidden from command completio
 complete_ignore_dirs = ("/mnt/c",)      # PATH directories hidden from completion
 probe_flags = False                    # don't run `cmd --help` for flag completion (default True)
 import_cwd = False                     # don't let `import` search the current directory (default True)
-def prompt(): return f"{os.getcwd()} $ "
+PS1 = "{cyan}{cwd}{reset} $ "          # the prompt, see below
 ```
+
+### Prompt
+
+`PS1` is a Python string, so assign it (don't `export` it). The starter `~/.pyshrc` holds the default:
+
+```python
+PS1 = "{venv}{green}{user}@{host}{reset} {cyan}{cwd}{reset}{white}{branch}{reset}{red}{status}{reset}{grey}>{reset} "
+```
+
+| field | |
+|---|---|
+| `{venv}` | `(name) ` while a virtualenv is active, else empty |
+| `{user}` `{host}` | who and where |
+| `{cwd}` | working directory, with your home as `~` |
+| `{branch}` | `(branch)` inside a git repository, else empty |
+| `{status}` | `[N]` when the last command failed, else empty |
+| `{red}` `{green}` `{yellow}` `{blue}` `{magenta}` `{cyan}` `{white}` `{grey}` `{bold}` `{reset}` | colours |
+
+Write a literal brace as `{{` or `}}`. `\n` makes a multi-line prompt. For anything computed, use a function; its
+result is shown as is:
+
+```python
+def PS1(): return $(date +%H:%M) + " > "
+```
+
+bash escapes such as `\u` and `\w` are not understood. A broken `PS1` is reported once and the default is shown.
 
 Environment variables: `PYSH_HOME` (Python home, defaults to the build-time prefix), `PYSH_IMPORT_CWD=0` (don't search the current directory when importing),
 `PYSH_HISTFILE` (history file, default `~/.pysh_history`), `PYSH_RESIZE=reflow|redraw` (what to assume after a window resize when the terminal can't tell pysh) and `PYSH_TTYLOG=file` (copy everything the

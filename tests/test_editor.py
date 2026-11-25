@@ -543,19 +543,19 @@ class DefaultAliases(EditorCase):
         self.assertNotIn("\x1b[01;34m", self.s.raw.decode().split("ls -d adir")[-1])
 
     def test_rc_file_can_override(self):
-        with open(os.path.join(self.s.home, ".pyshrc.py"), "w") as f: f.write("aliases['ls'] = 'ls -1'\n")
+        with open(os.path.join(self.s.home, ".pyshrc"), "w") as f: f.write("aliases['ls'] = 'ls -1'\n")
         s2 = Session(rows=24, cols=60, home=self.s.home); self.addCleanup(s2.close)
         s2.send("alias\r", 0.5)
         self.assertIn("alias ls='ls -1'", s2.text())
 
 
 class ImportCwdSetting(unittest.TestCase):
-    """`import_cwd` in ~/.pyshrc.py controls whether the current directory is searched by `import`."""
+    """`import_cwd` in ~/.pyshrc controls whether the current directory is searched by `import`."""
     def session(self, rc):
         home = tempfile.mkdtemp(prefix="pysh-test-")
         with open(os.path.join(home, "mymod.py"), "w") as f: f.write("x = 42\n")
         if rc is not None:
-            with open(os.path.join(home, ".pyshrc.py"), "w") as f: f.write(rc)
+            with open(os.path.join(home, ".pyshrc"), "w") as f: f.write(rc)
         s = Session(rows=24, cols=80, home=home); self.addCleanup(s.close)
         return s
 
@@ -568,6 +568,273 @@ class ImportCwdSetting(unittest.TestCase):
         s = self.session("import_cwd = False\n")
         s.send("import mymod\r", 0.6)
         self.assertIn("No module named 'mymod'", s.text())
+
+
+class RcFile(unittest.TestCase):
+    """~/.pyshrc runs like a script at interactive startup."""
+    def session(self, rc, files=()):
+        home = tempfile.mkdtemp(prefix="pysh-test-")
+        for name, text in ((".pyshrc", rc), *files):
+            if text is not None:
+                with open(os.path.join(home, name), "w") as f: f.write(text)
+        s = Session(rows=40, cols=100, home=home); self.addCleanup(s.close)
+        return s
+
+    def ask(self, s, command):
+        s.send(command + "\r", 0.8)
+        return s.text()
+
+    def test_exports_aliases_substitution_and_python(self):
+        s = self.session("export EDITOR=vim\nexport GREETING=\"hi $USER\"\nexport N=$(echo 42)\nalias hello='echo HELLO'\n"
+                         "import os\nif True:\n    os.environ['FROM_BLOCK'] = 'b'\n\ndef double(x): return x * 2\n")
+        self.assertIn("E=vim G=hi tester N=42 B=b", self.ask(s, 'sh -c \'echo "E=$EDITOR G=$GREETING N=$N B=$FROM_BLOCK"\''))
+        self.assertIn("\nHELLO", self.ask(s, "hello"))
+        self.assertIn("\n14", self.ask(s, "double(7)"))
+
+    SCRIPT_STYLE = r'''#!/usr/local/bin/pysh
+"""My startup file - a docstring spanning
+several lines, like the examples have."""
+import os, re, sys
+import collections as coll
+from functools import partial
+
+COLOURS = {
+    "ok": 32,
+    "bad": 31,
+}
+square = lambda x: x * x
+add_ten = partial(lambda a, b: a + b, 10)
+
+def clean(s):
+    """a helper with a docstring"""
+    return re.sub(r"[\x00-\x1f]", "?", str(s))
+
+def words(*args):
+    r = !(echo @(list(args)))
+    return r.out.split()
+
+def shout(text):
+    return $(echo @(text)).upper()
+
+class Counter:
+    def __init__(self): self.n = 0
+
+    def bump(self):
+        self.n += 1
+        return self.n
+
+def decorate(f):
+    return lambda: "<" + f() + ">"
+
+@decorate
+def tag():
+    return "tagged"
+
+counter = Counter()
+try:
+    import no_such_module_xyz
+except ImportError:
+    missing = True
+for key in COLOURS:
+    counter.bump()
+today = $(echo 2026)
+alias hello='echo HELLO'
+export FROM_RC=yes
+'''
+
+    def test_everything_it_defines_is_available_in_the_session(self):
+        s = self.session(self.SCRIPT_STYLE)
+        self.assertNotIn("Error", s.text(), s.text())                      # the whole file loaded cleanly
+        checks = [
+            ("print(os.path.basename('/a/imported'), sys.maxsize > 0, coll.Counter('aab')['a'])", "imported True 2"),
+            ("print(square(9), add_ten(5), COLOURS['bad'])", "81 15 31"),
+            ("print(clean('a\\tb'), words('x', 'y z'))", "a?b ['x', 'y', 'z']"),
+            ("print(shout('quiet'), tag())", "QUIET <tagged>"),
+            ("print(counter.bump(), Counter().bump(), missing, today)", "3 1 True 2026"),
+            ("hello", "HELLO"),
+            ("sh -c 'echo rc=$FROM_RC'", "rc=yes"),
+        ]
+        for command, expected in checks:
+            with self.subTest(command=command):
+                s.send("clear\r", 0.4)
+                self.assertIn("\n" + expected, self.ask(s, command))
+
+    def test_functions_can_change_globals_set_there(self):
+        s = self.session("count = 0\ndef bump():\n    global count\n    count += 1\n")
+        self.ask(s, "bump(); bump()")
+        self.assertIn("\n2", self.ask(s, "count"))
+
+    def test_file_name_is_available_while_it_runs(self):
+        s = self.session("import os\nRC_NAME = os.path.basename(__file__)\n")
+        self.assertIn("\n'.pyshrc'", self.ask(s, "RC_NAME"))
+
+    def test_path_with_tilde(self):
+        s = self.session("export PATH=~/bin:$PATH\n")
+        self.assertIn(f"first={s.home}/bin\n", self.ask(s, 'sh -c \'echo "first=${PATH%%:*}"\'') + "\n")
+
+    def test_errors_do_not_stop_the_file_or_mark_the_prompt(self):
+        s = self.session("no_such_command_here\n1/0\nfalse\nexport AFTER=yes\n")
+        self.assertIn("command not found", s.text())
+        self.assertIn("ZeroDivisionError", s.text())
+        self.assertNotIn("]>", s.text())
+        self.assertIn("A=yes", self.ask(s, "sh -c 'echo A=$AFTER'"))
+
+    def test_does_not_import_from_the_current_directory(self):
+        # the session starts in $HOME, which holds a planted module
+        s = self.session("import planted_module\n", files=(("planted_module.py", "print('PLANTED RAN')\n"),))
+        self.assertIn("No module named 'planted_module'", s.text())
+        self.assertNotIn("PLANTED RAN\n", s.text())
+        self.assertIn("PLANTED RAN", self.ask(s, "import planted_module"))        # but typing it yourself still works
+
+    def test_scripts_do_not_read_it(self):
+        import subprocess
+        from term import PYSH
+        s = self.session("export ONLY_INTERACTIVE=1\n")
+        r = subprocess.run([PYSH, "-c", "sh -c 'echo v=$ONLY_INTERACTIVE'"], capture_output=True, text=True,
+                           env={"HOME": s.home, "PATH": os.environ["PATH"]})
+        self.assertEqual(r.stdout.strip(), "v=")
+
+
+class DefaultRcFile(unittest.TestCase):
+    """An interactive pysh with no ~/.pyshrc writes a starter one and runs it."""
+    def home(self):
+        d = tempfile.mkdtemp(prefix="pysh-test-")
+        self.addCleanup(lambda: (os.chmod(d, 0o700), __import__("shutil").rmtree(d, ignore_errors=True)))
+        return d
+
+    def start(self, home):
+        s = Session(rows=40, cols=100, home=home); self.addCleanup(s.close)
+        return s
+
+    def ask(self, s, command):
+        s.send(command + "\r", 0.8)
+        return s.text()
+
+    def read(self, path):
+        with open(path) as f: return f.read()
+
+    def test_created_with_the_ls_alias_and_documented_settings(self):
+        home = self.home(); rc = os.path.join(home, ".pyshrc")
+        s = self.start(home)
+        self.assertNotIn("Error", s.text(), s.text())
+        text = self.read(rc)
+        for word in ('aliases["ls"] = "ls --color=auto"', "# probe_flags = True", "# import_cwd = True", "# complete_ignore_dirs"):
+            self.assertIn(word, text)
+        self.assertIn("alias ls='ls --color=auto'", self.ask(s, "alias"))
+        self.assertIn("NameError", self.ask(s, "print(_ls)"))                 # its scratch variable doesn't linger
+
+    def test_the_commented_lines_are_valid_when_uncommented(self):
+        home = self.home(); rc = os.path.join(home, ".pyshrc")
+        self.start(home).close()
+        lines = self.read(rc).split("\n")
+        start = lines.index("# Settings, shown with their defaults. Uncomment to change.")
+        with open(rc, "w") as f:
+            f.write("\n".join(l[2:] if i > start and l.startswith("# ") and not l.startswith("# Examples") else l
+                              for i, l in enumerate(lines)))
+        s = self.start(home)
+        self.assertNotIn("Error", s.text(), s.text())
+        self.assertIn("alias ll='ls -l'", self.ask(s, "alias"))
+
+    def test_an_existing_file_is_left_alone(self):
+        home = self.home(); rc = os.path.join(home, ".pyshrc")
+        with open(rc, "w") as f: f.write("export MINE=1\n")
+        s = self.start(home)
+        self.assertEqual(self.read(rc), "export MINE=1\n")
+        self.assertNotIn("color=auto", self.ask(s, "alias"))                 # the alias lives in the file now
+
+    def test_unwritable_home_still_gets_the_defaults(self):
+        if os.geteuid() == 0: self.skipTest("root can write anywhere")
+        home = self.home(); os.chmod(home, 0o500)
+        s = self.start(home)
+        self.assertFalse(os.path.exists(os.path.join(home, ".pyshrc")))
+        self.assertIn("alias ls='ls --color=auto'", self.ask(s, "alias"))
+
+    def test_dangling_symlink_is_not_written_through(self):
+        home = self.home(); target = os.path.join(home, "elsewhere")
+        os.symlink(target, os.path.join(home, ".pyshrc"))
+        s = self.start(home)
+        self.assertFalse(os.path.exists(target))
+        self.assertNotIn("Error", s.text())
+
+    def test_old_python_rc_name_is_no_longer_read(self):
+        home = self.home()
+        with open(os.path.join(home, ".pyshrc.py"), "w") as f: f.write("aliases['old'] = 'echo old'\n")
+        s = self.start(home)
+        self.assertNotIn("alias old=", self.ask(s, "alias"))
+
+    def test_starter_file_holds_the_current_prompt(self):
+        home = self.home()
+        s = self.start(home)
+        self.assertIn('PS1 = "{venv}{green}{user}@{host}{reset} {cyan}{cwd}{reset}{white}{branch}{reset}{red}{status}{reset}{grey}>{reset} "',
+                      self.read(os.path.join(home, ".pyshrc")))
+        raw = s.raw.decode()
+        for piece in ("\x1b[32mtester@", "\x1b[36m~", "\x1b[90m>"): self.assertIn(piece, raw)
+
+    def test_scripts_and_dash_c_create_nothing(self):
+        import subprocess
+        from term import PYSH
+        home = self.home()
+        subprocess.run([PYSH, "-c", "echo hi"], env={"HOME": home, "PATH": os.environ["PATH"]}, capture_output=True, check=True)
+        subprocess.run([PYSH], input="echo hi\n", env={"HOME": home, "PATH": os.environ["PATH"]}, capture_output=True, text=True, check=True)
+        self.assertFalse(os.path.exists(os.path.join(home, ".pyshrc")))
+
+
+class UserPrompt(unittest.TestCase):
+    """PS1 (and the older `prompt`) set in ~/.pyshrc or typed at the shell."""
+    def session(self, rc):
+        home = tempfile.mkdtemp(prefix="pysh-test-")
+        with open(os.path.join(home, ".pyshrc"), "w") as f: f.write(rc)
+        s = Session(rows=30, cols=80, home=home); self.addCleanup(s.close)
+        return s
+
+    def ask(self, s, command):
+        s.send(command + "\r", 0.7)
+        return s.text()
+
+    def test_fields_and_colours(self):
+        s = self.session('PS1 = "{magenta}[{user}]{reset} {cwd} {status}> "\n')
+        self.assertIn("[tester] ~ >", s.text())
+        self.assertIn("\x1b[35m[tester]", s.raw.decode())
+        self.assertIn("[tester] ~ [1]>", self.ask(s, "false"))
+
+    def test_changing_it_in_the_session(self):
+        s = self.session("")
+        self.assertIn("\nnew> ", self.ask(s, 'PS1 = "new> "') + " ")
+
+    def test_function_with_shell_substitution_is_not_formatted(self):
+        s = self.session('def PS1(): return $(echo hey) + " {cwd}> "\n')
+        self.assertIn("hey {cwd}>", s.text())
+
+    def test_editing_still_lines_up_with_a_custom_prompt(self):
+        s = self.session('PS1 = "{bold}{yellow}py{reset}> "\n')
+        s.send("echo ac", 0.4); s.send("\x1b[D", 0.3); s.send("b", 0.4)
+        self.assertIn("py> echo abc", s.text())
+        self.assertIn("\nabc", self.ask(s, ""))
+
+    def test_multi_line_prompt(self):
+        s = self.session('PS1 = "first {cwd}\\n> "\n')
+        text = self.ask(s, "echo one")
+        self.assertIn("first ~\n> echo one\none\nfirst ~\n>", text)
+
+    def test_branch_value_is_not_treated_as_a_template(self):
+        s = self.session('PS1 = "{cwd}> "\n')
+        os.makedirs(os.path.join(s.home, "{user}"))
+        self.assertIn("~/{user}>", self.ask(s, "cd '{user}'"))
+
+    def test_a_broken_one_falls_back_and_says_so_once(self):
+        s = self.session('PS1 = "{nope}> "\n')
+        text = self.ask(s, "echo still-works")
+        self.assertEqual(text.count("bad PS1"), 1, text)
+        self.assertIn("\nstill-works", text)
+        self.assertIn("tester@", text)
+        self.ask(s, "def PS1(): return 1/0")
+        text = self.ask(s, "")                                   # a blank line ends the definition
+        self.assertIn("ZeroDivisionError", text)
+        self.assertIn("\nalive", self.ask(s, "echo alive"))
+
+    def test_older_prompt_setting_still_wins(self):
+        s = self.session('PS1 = "ps1> "\ndef prompt(): return "old> "\n')
+        self.assertIn("old>", s.text())
 
 
 class ForceShellEditing(EditorCase):

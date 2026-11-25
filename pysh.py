@@ -1,5 +1,5 @@
 # pysh -- embedded shell logic.  Executed by pysh.c inside __main__.
-import ast, builtins, codeop, glob, inspect, io, keyword, operator, os, re, shutil, signal, subprocess, sys, tempfile, threading, time, traceback, types
+import ast, builtins, codeop, glob, importlib, inspect, io, keyword, operator, os, re, shutil, signal, site, subprocess, sys, tempfile, threading, time, traceback, types
 
 VERSION = "0.1"
 shell = sys.modules["__main__"]                # pysh's own internals: shell.jobs, shell.history, ...
@@ -289,13 +289,19 @@ def getvar(name):
 def expand_word(segs):
     return [x for w in brace_words(segs) for x in _expand_word(w)]
 
-def _expand_word(segs):
+def expand_assignment(segs):
+    """The value of `NAME=...`, as bash does it: no word splitting, no globbing, no braces,
+    and `~` is expanded at the start and after `=` or `:`  (so `PATH=~/bin:~/x:$PATH` works)."""
+    return _expand_word(segs, assign=True)[0]
+
+def _expand_word(segs, assign=False):
     fields = [[]]                 # each field: list of (text, quoted)
     def put(t, q): fields[-1].append((t, q))
     for idx, (kind, text) in enumerate(segs):
         if kind == "lit":
             if idx == 0 and text.startswith("~"):
-                m = re.match(r"~[^/]*", text); text = os.path.expanduser(m.group()) + text[m.end():]
+                m = re.match(r"~[^/:]*" if assign else r"~[^/]*", text); text = os.path.expanduser(m.group()) + text[m.end():]
+            if assign: text = re.sub(r"(?<=[=:])~[^/:=]*", lambda m: os.path.expanduser(m.group()), text)
             put(text, False)
         elif kind == "sq": put(text, True)
         elif kind == "dq":
@@ -305,6 +311,8 @@ def _expand_word(segs):
                 elif k == "var": put(getvar(t), True)
                 elif k == "arith": put(str(arith(t)), True)
                 else: put(capture(t).rstrip("\n"), True)
+        elif assign and kind == "var": put(getvar(text), True)
+        elif assign and kind == "sub": put(capture(text).rstrip("\n"), True)
         elif kind == "var":
             ws = getvar(text).split()
             if not ws: continue
@@ -319,10 +327,12 @@ def _expand_word(segs):
         elif kind == "py":
             v = eval(text, *_scope())
             vs = list(v) if isinstance(v, (list, tuple, set)) else [v]
+            if assign: vs = [" ".join(map(str, vs))]
             for j, x in enumerate(vs):
                 if j or not fields[-1]: pass
                 if j: fields.append([])
                 put(str(x), True)
+    if assign: return ["".join(t for t, _ in fields[0])]
     res = []
     for f in fields:
         lit = "".join(t for t, _ in f)
@@ -510,8 +520,110 @@ def b_alias(a):
 def b_unalias(a):
     for k in a: aliases.pop(k, None)
     return 0
+# ----------------------------------------------------------- virtualenvs
+def _from_stdlib(p):
+    stdlib = os.path.dirname(os.__file__)
+    return p.startswith(stdlib) and "-packages" not in p or p.endswith(".zip") and os.path.dirname(p) == os.path.dirname(stdlib)
+
+# what `site` added for the system interpreter; an isolated virtualenv hides these
+_SITE_ENTRIES = [p for p in sys.path if p and not _from_stdlib(p) and p not in os.environ.get("PYTHONPATH", "").split(os.pathsep)]
+_venv = None                 # what activating changed, so deactivate can undo it
+
+def _venv_config(root):
+    """pyvenv.cfg as a dict, or None if `root` is not a virtualenv."""
+    try:
+        with open(os.path.join(root, "pyvenv.cfg")) as f:
+            return {k.strip().lower(): v.strip() for k, sep, v in (line.partition("=") for line in f) if sep}
+    except (OSError, UnicodeDecodeError):
+        return None
+
+def _forget_modules(roots):
+    """drop cached modules loaded from under any of `roots`, so the next import looks again"""
+    roots = tuple(r.rstrip("/") + "/" for r in roots)
+    for name, mod in list(sys.modules.items()):
+        if (getattr(mod, "__file__", None) or "").startswith(roots) and name != "__main__": del sys.modules[name]
+
+def _venv_imports(root, cfg):
+    """Point `import` at the virtualenv. -> the saved state, or None if it was made for another Python version."""
+    want = (cfg.get("version") or cfg.get("version_info") or "").split(".")[:2]
+    if want != [str(sys.version_info[0]), str(sys.version_info[1])]: return None
+    packages = os.path.join(root, "lib", f"python{want[0]}.{want[1]}", "site-packages")
+    isolated = cfg.get("include-system-site-packages", "false").lower() != "true"
+    before = list(sys.path)
+    site.addsitedir(packages)                             # also processes .pth files
+    added = [p for p in sys.path if p not in before]
+    hidden = [p for p in _SITE_ENTRIES if p in before and p not in added] if isolated else []
+    rest = [p for p in before if p not in hidden]
+    at = next((i for i, p in enumerate(rest) if p in _SITE_ENTRIES), len(rest))        # ahead of system packages
+    sys.path[:] = rest[:at] + added + rest[at:]
+    state = {"added": added, "hidden": hidden, "prefix": (sys.prefix, sys.exec_prefix), "executable": sys.executable}
+    sys.prefix = sys.exec_prefix = root
+    sys.executable = os.path.join(root, "bin", "python")
+    _forget_modules(hidden)
+    importlib.invalidate_caches()
+    return state
+
+def activate_venv(root):
+    """Use the virtualenv at `root`: $PATH and $VIRTUAL_ENV for commands, sys.path for `import`."""
+    global _venv
+    root = os.path.abspath(os.path.expanduser(root))
+    cfg = _venv_config(root)
+    if cfg is None or not os.path.isdir(os.path.join(root, "bin")):
+        sh_error(f"activate: {root}: not a virtualenv (no pyvenv.cfg and bin/)"); return 1
+    if os.environ.get("VIRTUAL_ENV"): deactivate_venv()
+    pythonhome = os.environ.pop("PYTHONHOME", None)
+    os.environ["VIRTUAL_ENV"] = root
+    os.environ["PATH"] = os.path.join(root, "bin") + os.pathsep + os.environ.get("PATH", os.defpath)
+    state = _venv_imports(root, cfg)
+    if state is None:
+        sh_error(f"activate: {root} is a Python {cfg.get('version', '?')} virtualenv and pysh runs "
+                 f"{sys.version_info[0]}.{sys.version_info[1]}: its commands are on $PATH, but `import` here is unchanged")
+        state = {}
+    _venv = dict(state, root=root, pythonhome=pythonhome)
+    _cmdcache.clear()
+    return 0
+
+def deactivate_venv():
+    global _venv
+    root = os.environ.pop("VIRTUAL_ENV", None)
+    if root is None: sh_error("deactivate: no virtualenv is active"); return 1
+    bin_dir = os.path.join(root, "bin")                   # take out only our entry; keep other $PATH changes
+    os.environ["PATH"] = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if p != bin_dir)
+    state, _venv = _venv or {}, None
+    if state.get("pythonhome") is not None: os.environ["PYTHONHOME"] = state["pythonhome"]
+    if "added" in state:
+        sys.path[:] = [p for p in sys.path if p not in state["added"]] + [p for p in state["hidden"] if p not in sys.path]
+        sys.prefix, sys.exec_prefix = state["prefix"]
+        sys.executable = state["executable"]
+        _forget_modules([root])
+        importlib.invalidate_caches()
+    _cmdcache.clear()
+    return 0
+
+def adopt_venv():
+    """Started inside an activated virtualenv ($VIRTUAL_ENV): make `import` see it, as `python` would."""
+    global _venv
+    root = os.environ.get("VIRTUAL_ENV")
+    cfg = _venv_config(root) if root and os.path.isabs(root) else None
+    if cfg is None: return
+    state = _venv_imports(root, cfg)
+    if state is not None: _venv = dict(state, root=root, pythonhome=None)
+
+def b_activate(a):
+    if len(a) > 1: sh_error("usage: activate [DIR]"); return 2
+    if a: return activate_venv(a[0])
+    for guess in (".venv", "venv"):
+        if _venv_config(guess) is not None: return activate_venv(guess)
+    sh_error("activate: no .venv or venv here; give the directory"); return 1
+
+def b_deactivate(a): return deactivate_venv()
+
 def b_source(a):
     if not a: sh_error("source: filename required"); return 2
+    path = os.path.abspath(a[0])
+    if os.path.basename(path) == "activate" and os.path.basename(os.path.dirname(path)) == "bin":
+        root = os.path.dirname(os.path.dirname(path))
+        if _venv_config(root) is not None: return activate_venv(root)      # that file is bash; do what it means
     try: run_script(open(a[0]).read())
     except OSError as e: sh_error(f"source: {a[0]}: {e.strerror}"); return 1
     return 0
@@ -527,7 +639,7 @@ def b_type(a):
         else: sh_error(f"type: {w}: not found"); rc = 1
     return rc
 USAGE = """\
-Usage: pysh [-e] [-c COMMAND [ARG...]] [SCRIPT [ARG...]]
+Usage: pysh [-eil] [--norc] [-c COMMAND [ARG...]] [SCRIPT [ARG...]]
        pysh [-h | --help | -V | --version]"""
 
 HELP = USAGE + """
@@ -539,6 +651,9 @@ shell command otherwise.
 Options:
   -c COMMAND     run COMMAND, then exit
   -e             stop at the first command that fails (scripts and -c)
+  -i             interactive: read ~/.pyshrc, also before -c or a script
+  -l, --login    accepted for login(1), ssh, tmux and editors; no extra file is read
+  --norc         don't read (or create) ~/.pyshrc; use it to get in if that file is broken
   -h, --help     show this help and exit
   -V, --version  show version information and exit
   SCRIPT         run a file of mixed shell/Python lines; start it with `#!/usr/bin/pysh`
@@ -576,7 +691,7 @@ Editing keys:
   Alt-B / Alt-F          move by word
 
 Files:
-  ~/.pyshrc.py           run at interactive startup, in the Python namespace
+  ~/.pyshrc              run at interactive startup like a script; created if missing
   ~/.pysh_history        command history ($PYSH_HISTFILE to change)
 
 Environment: PYSH_HOME (Python home; default is the build-time prefix),
@@ -588,7 +703,7 @@ def b_help(a):
 
 BUILTINS = {"cd": b_cd, "pwd": b_pwd, "exit": b_exit, "quit": b_exit, "export": b_export, "unset": b_unset,
             "alias": b_alias, "unalias": b_unalias, "source": b_source,
-            ".": b_source, "history": b_history, "type": b_type, "help": b_help}
+            ".": b_source, "activate": b_activate, "deactivate": b_deactivate, "history": b_history, "type": b_type, "help": b_help}
 
 def open_redirs(st, env):
     """-> (stdin, stdout, stderr, to_close).  Files, or None for 'inherit'."""
@@ -930,10 +1045,13 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
         while words and len(words[0]) and words[0][0][0] == "lit" and re.match(r"[A-Za-z_]\w*=", words[0][0][1]):
             k, _, v = words[0][0][1].partition("=")
             words[0] = [("lit", v)] + words[0][1:] if (v or len(words[0]) > 1) else [("sq", "")]
-            vals = expand_word(words[0])
-            env[k] = vals[0] if vals else ""
+            env[k] = expand_assignment(words[0])
             words.pop(0)
-        argv = [a for w in words for a in expand_word(w)]
+        argv = []
+        for w in words:
+            if argv[:1] == ["export"] and w and w[0][0] == "lit" and re.match(r"[A-Za-z_]\w*=", w[0][1]):
+                argv.append(expand_assignment(w))                 # `export NAME=value` is an assignment too
+            else: argv.extend(expand_word(w))
         argvs.append((argv, env))
     if len(pipe) == 1 and not argvs[0][0]:           # bare VAR=val
         os.environ.update(argvs[0][1]); return Result(0, "", "", 0, cmdline)
@@ -1178,7 +1296,7 @@ ns["__doc__"] = None
 ns["import_cwd"] = True                          # `import` finds modules in the current directory (or a script's own directory); False disables
 ns["probe_flags"] = True                         # Tab on a -flag runs `cmd --help` for system programs; False disables
 ns["complete_ignore_dirs"] = ("/mnt/c",)   # PATH directories hidden from command completion
-ns["complete_ignore"] = (".dll", ".exe", ".vbs", ".efi", ".mof", ".bat", ".drv", ".sys", ".tlb", ".xml")   # command-name suffixes hidden from Tab completion (set in ~/.pyshrc.py)
+ns["complete_ignore"] = (".dll", ".exe", ".vbs", ".efi", ".mof", ".bat", ".drv", ".sys", ".tlb", ".xml")   # command-name suffixes hidden from Tab completion (set in ~/.pyshrc)
 
 KW = {"def", "class", "if", "elif", "else", "for", "while", "with", "try", "except", "finally", "import",
       "from", "async", "return", "raise", "del", "assert", "global", "nonlocal", "pass", "lambda", "yield", "match", "await"}
@@ -1311,18 +1429,34 @@ def git_branch():
     except OSError: return None
     return clean(head[16:] if head.startswith("ref: refs/heads/") else head[:7]) if head else None
 
-def prompt():
-    _cmdcache.clear()
+DEFAULT_PS1 = "{venv}{green}{user}@{host}{reset} {cyan}{cwd}{reset}{white}{branch}{reset}{red}{status}{reset}{grey}>{reset} "
+_PS1_COLOURS = {name: f"\x1b[{code}m" for name, code in (("reset", 0), ("bold", 1), ("red", 31), ("green", 32), ("yellow", 33),
+                ("blue", 34), ("magenta", 35), ("cyan", 36), ("white", 37), ("grey", 90))}
+ns["PS1"] = DEFAULT_PS1
+_ps1_reported = None
+
+def prompt_fields():
+    """What `{name}` can stand for in PS1. Names that come from outside are cleaned of control characters."""
     cwd = logical_cwd(); home = os.path.expanduser("~")
     if cwd == home or cwd.startswith(home + "/"): cwd = "~" + cwd[len(home):]
-    short = cwd                                 # the full path, never abbreviated
-    rc = f"\x1b[31m[{last.returncode}]\x1b[0m" if last.returncode else ""
     b = git_branch()
-    br = f"\x1b[37m({b})\x1b[0m" if b else ""
-    user = clean(os.environ.get("USER") or "user")
-    host = clean(os.uname().nodename.split(".")[0])
-    short = clean(short)
-    return f"\x1b[32m{user}@{host}\x1b[0m \x1b[36m{short}\x1b[0m{br}{rc}\x1b[90m>\x1b[0m "
+    venv = os.environ.get("VIRTUAL_ENV")
+    return dict(_PS1_COLOURS, venv=f"({clean(os.path.basename(venv.rstrip('/')))}) " if venv else "", cwd=clean(cwd),                      # the full path, never abbreviated
+                user=clean(os.environ.get("USER") or "user"), host=clean(os.uname().nodename.split(".")[0]),
+                branch=f"({b})" if b else "", status=f"[{last.returncode}]" if last.returncode else "")
+
+def prompt():
+    """PS1 from the namespace: a string with {fields}, or a function returning the finished prompt.
+    A broken one is reported once and the default is shown instead."""
+    global _ps1_reported
+    ps1 = ns.get("PS1", DEFAULT_PS1)
+    try:
+        if callable(ps1): return str(ps1())
+        return str(ps1).format_map(prompt_fields())
+    except Exception as e:
+        problem = f"{type(e).__name__}: {e}"
+        if problem != _ps1_reported: sh_error(f"bad PS1 ({problem}); using the default"); _ps1_reported = problem
+        return DEFAULT_PS1.format_map(prompt_fields())
 
 # ------------------------------------------------- fish-style autosuggest/highlight
 def _valid_cmd(w):
@@ -1386,7 +1520,7 @@ def flags_for(cmd):
     """Parse `cmd --help` into [(flag, description)] (cached, 1.5s timeout).
 
     This runs the program, so it is limited to system programs (see trusted_command) and can be turned off
-    with `probe_flags = False` in ~/.pyshrc.py."""
+    with `probe_flags = False` in ~/.pyshrc."""
     if not ns.get("probe_flags", True): return []
     if cmd in _helpcache: return _helpcache[cmd]
     res, path = [], trusted_command(cmd)
@@ -1428,6 +1562,7 @@ BUILTIN_DOC = {"cd": "change directory", "exit": "leave the shell", "quit": "lea
                "export": "set environment variables", "unset": "remove environment variables",
                "alias": "define or list aliases", "unalias": "remove aliases", "jobs": "list background jobs",
                "source": "run a script in this shell", ".": "run a script in this shell",
+               "activate": "use a virtualenv", "deactivate": "leave the virtualenv",
                "history": "show command history", "pwd": "print the working directory", "fg": "resume a job in the foreground", "bg": "resume a job in the background",
                "wait": "wait for background jobs", "kill": "signal a process or %job", "type": "describe how a name resolves", "help": "pysh help"}
 
@@ -1558,8 +1693,12 @@ def read_entry(tty):
         if not l: raise EOFError
         return l.rstrip("\n")
     if INTERACTIVE: reap_jobs(notify=True)
-    p = ns.get("prompt", prompt)
-    first = rl(p() if callable(p) else p)
+    _cmdcache.clear()
+    older = ns.get("prompt")                         # a `prompt` string or function still wins over PS1
+    text = prompt() if older is None else str(older() if callable(older) else older)
+    above, newline, text = text.rpartition("\n")    # the line editor draws one line; print any earlier ones first
+    if newline: print(above, flush=True)
+    first = rl(text)
     if not first.strip(): return first
     lines = [first]
     while True:
@@ -1575,29 +1714,79 @@ def read_entry(tty):
         lines.append(rl("\x1b[90m…\x1b[0m "))
     return "\n".join(lines)
 
-def default_aliases():
-    """Interactive niceties: `ls` gets --color=auto when this ls supports it (checked once at startup).
-    Override or remove in ~/.pyshrc.py (aliases["ls"] = ... / del aliases["ls"])."""
-    ls = which_safe("ls")                     # never a './ls' picked up through a relative PATH entry
-    if not ls: return
-    try:
-        ok = subprocess.run([ls, "--color=auto", "-d", "."], stdin=subprocess.DEVNULL, cwd="/",
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2).returncode == 0
-    except Exception: ok = False
-    if ok: aliases.setdefault("ls", "ls --color=auto")
+DEFAULT_RC = """\
+# ~/.pyshrc - run by every interactive pysh. pysh created this file because it didn't exist; edit it freely.
+# It takes the same syntax as a script, and whatever it defines at the top level stays in your session:
+# imports, variables, functions, aliases. Environment variables need `export`.
 
-def repl():
+# Colour `ls` output, if this ls supports it. (which_safe never picks up a ./ls from the current directory.)
+_ls = shell.which_safe("ls")
+if _ls and !(@(_ls) --color=auto -d /):
+    aliases["ls"] = "ls --color=auto"
+del _ls
+
+# Settings, shown with their defaults. Uncomment to change.
+# probe_flags = True                  # Tab on a -flag runs `cmd --help` (system programs only)
+# import_cwd = True                   # `import` finds modules in the current directory
+# complete_ignore = (".dll", ".exe", ".vbs", ".efi", ".mof", ".bat", ".drv", ".sys", ".tlb", ".xml")
+# complete_ignore_dirs = ("/mnt/c",)  # PATH directories left out of command completion
+
+# The prompt. Fields: {venv} {user} {host} {cwd} {branch} {status}
+# Colours: {red} {green} {yellow} {blue} {magenta} {cyan} {white} {grey} {bold} {reset}
+PS1 = "@PS1@"
+
+# Examples
+# export EDITOR=vim
+# export PATH=~/bin:$PATH
+# alias ll='ls -l'
+# def PS1(): return $(date +%H:%M) + " > "        # a function can compute anything
+""".replace("@PS1@", DEFAULT_PS1)
+
+def create_default_rc(path):
+    """Write the starter ~/.pyshrc, never over anything that exists. Only into a home directory that is ours,
+    so `sudo pysh` with $HOME kept doesn't leave a root-owned file there. -> True if the file was written."""
+    home = os.path.dirname(path)
+    try:
+        if os.path.lexists(path) or os.stat(home).st_uid != os.geteuid(): return False
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(fd, "w") as f: f.write(DEFAULT_RC)
+        return True
+    except OSError:
+        return False
+
+def run_rc(create=True):
+    """Interactive startup: run ~/.pyshrc like a script (shell and Python lines) in the shell's namespace,
+    creating it first if there is none. If it can't be created, the starter text still runs, from memory.
+    An error is reported and does not stop the shell."""
+    rcf = os.path.expanduser("~/.pyshrc")
+    if create: create_default_rc(rcf)
+    here = "" in sys.path
+    while "" in sys.path: sys.path.remove("")          # the startup file must not import from whatever directory we opened in
+    try:
+        if os.path.isfile(rcf):
+            with open(rcf) as f: text = f.read()
+            ns["__file__"] = rcf                          # as in a script, while it runs
+            run_script(text, rcf)
+        elif not os.path.lexists(rcf):
+            run_script(DEFAULT_RC)
+    except KeyboardInterrupt: print("\n.pyshrc: interrupted", file=sys.stderr)
+    except SystemExit: raise
+    except Exception: traceback.print_exc()
+    finally:
+        ns.pop("__file__", None)
+        if here and "" not in sys.path: sys.path.insert(0, "")
+        _setlast(Result())                             # a failing line in the rc file shouldn't mark the first prompt
+
+def repl(interactive=False, norc=False):
     tty = os.isatty(0) and os.isatty(1)
     global _exit_warned
     if tty:
         init_job_control()
-        default_aliases()
         load_history()
-        rcf = os.path.expanduser("~/.pyshrc.py")
-        if os.path.exists(rcf):
-            try: exec(compile(open(rcf).read(), rcf, "exec"), ns)
-            except Exception: traceback.print_exc()
-        drop_import_cwd()
+    if (tty or interactive) and not norc:
+        try: run_rc(create=tty)
+        except SystemExit as e: hup_jobs(); return exit_status(e)        # `exit` in an rc file leaves, as in bash
+    drop_import_cwd()
     internal_errors = 0
     while True:
         try: line = read_entry(tty)
@@ -1625,12 +1814,12 @@ def repl():
 
 def setup_import_path(first):
     """Like python: the REPL, -c and piped input search the current directory ('' follows `cd`); a script file
-    searches its own directory. PYSH_IMPORT_CWD=0 turns it off here; `import_cwd = False` in ~/.pyshrc.py does too."""
+    searches its own directory. PYSH_IMPORT_CWD=0 turns it off here; `import_cwd = False` in ~/.pyshrc does too."""
     if os.environ.get("PYSH_IMPORT_CWD", "1") in ("0", "false", "no", ""): return
     if first not in sys.path: sys.path.insert(0, first)
 
 def drop_import_cwd():
-    """After ~/.pyshrc.py: honour `import_cwd = False` by removing the current directory from the search path."""
+    """After ~/.pyshrc: honour `import_cwd = False` by removing the current directory from the search path."""
     if not ns.get("import_cwd", True):
         while "" in sys.path: sys.path.remove("")
 
@@ -1644,40 +1833,67 @@ def exit_status(e):
     print(c, file=sys.stderr)
     return 1
 
+def parse_options(args):
+    """-> (set of option letters/names, the remaining arguments). Raises ValueError for an unknown option.
+    Short options combine (`-lic`), as other programs expect of a shell."""
+    opts, i = set(), 0
+    longs = {"--version": "V", "--help": "h", "--login": "l", "--norc": "norc", "--interactive": "i"}
+    while i < len(args) and args[i].startswith("-") and args[i] != "-":
+        a = args[i]; i += 1
+        if a == "--": break
+        if a.startswith("--"):
+            if a not in longs: raise ValueError(a)
+            opts.add(longs[a])
+        else:
+            for ch in a[1:]:
+                if ch not in "Vhceil": raise ValueError("-" + ch)
+                opts.add(ch)
+    return opts, args[i:]
+
+def run_startup(norc):
+    """-i with -c or a script: read ~/.pyshrc first (never creating it). -> an exit status if it called `exit`."""
+    if norc: return None
+    try: run_rc(create=False)
+    except SystemExit as e: return exit_status(e)
+    return None
+
 def main(argv):
     global _batch, _errexit
     fix_pwd()
-    args, i = list(argv[1:]), 0
-    while i < len(args) and args[i].startswith("-") and args[i] not in ("-",):
-        a = args[i]
-        if a == "--": i += 1; break
-        if a in ("-V", "--version"):
-            print(f"pysh {VERSION}\nPython {sys.version}\nhome {sys.prefix}"); return 0
-        if a in ("-h", "--help"): print(HELP.replace("{builtins}", " ".join(sorted(BUILTINS)))); return 0
-        if a == "-e": _errexit = True; i += 1; continue
-        if a == "-c": break
-        sh_error(f"unknown option {a}"); print(USAGE, file=sys.stderr); return 2
-    args = args[i:]
-    if args and args[0] == "-c":
-        if len(args) < 2: sh_error("-c needs an argument"); return 2
-        sys.argv, _batch = ["pysh"] + args[2:], True
+    try: opts, args = parse_options(list(argv[1:]))
+    except ValueError as e: sh_error(f"unknown option {e}"); print(USAGE, file=sys.stderr); return 2
+    if "V" in opts:
+        print(f"pysh {VERSION}\nPython {sys.version}\nhome {sys.prefix}"); return 0
+    if "h" in opts: print(HELP.replace("{builtins}", " ".join(sorted(BUILTINS)))); return 0
+    if "e" in opts: _errexit = True
+    # -l / --login / argv[0] "-pysh" are accepted so that login(1), ssh, tmux and editors can start pysh;
+    # there is no separate login file to read.
+    interactive, norc = "i" in opts, "norc" in opts
+    adopt_venv()
+    if "c" in opts:
+        if not args: sh_error("-c needs an argument"); return 2
+        sys.argv = ["pysh"] + args[1:]
         setup_import_path("")
-        try: run_script(args[1])
+        if interactive and (status := run_startup(norc)) is not None: return status
+        _batch = True
+        try: run_script(args[0])
         except SystemExit as e: return exit_status(e)
         return last.returncode
     if args:
         path = args[0]
-        sys.argv, _batch = args, True
+        sys.argv = args
         setup_import_path(os.path.dirname(os.path.realpath(path)))
         try:
             with open(path) as f: text = f.read()
         except OSError as e: sh_error(f"{path}: {e.strerror}"); return 127
+        if interactive and (status := run_startup(norc)) is not None: return status
+        sys.argv, _batch = args, True
         ns["__file__"] = os.path.abspath(path)
         try: run_script(text, path)
         except SystemExit as e: return exit_status(e)
         return last.returncode
     setup_import_path("")
-    return repl()
+    return repl(interactive, norc)
 
 if __name__ == "__main__":
     sys.stdout.flush()

@@ -3,7 +3,8 @@
 pysh \- a shell with an embedded Python interpreter
 .SH SYNOPSIS
 .B pysh
-.RB [ \-e ]
+.RB [ \-eil ]
+.RB [ \-\-norc ]
 .RB [ \-c
 .IR command " [" arg " ...]]"
 .br
@@ -506,28 +507,105 @@ Python attributes by type, and options by parsing
 .B Ctrl\-D
 .B Alt\-B
 .BR Alt\-D .
+.SH OPTIONS
+.TP
+.B \-c \fIcommand\fR
+Run
+.I command
+and exit.
+.TP
+.B \-e
+Stop at the first command that fails (scripts and
+.BR \-c ).
+.TP
+.B \-i
+Interactive: read
+.IR ~/.pyshrc ,
+also before
+.B \-c
+or a script.
+.TP
+.B \-l ", " \-\-login
+Accepted so that login(1), ssh, tmux and editors can start pysh; no separate login file is read.
+.TP
+.B \-\-norc
+Neither read nor create
+.IR ~/.pyshrc .
+Use it from another shell if a broken file keeps you out.
+.PP
+Short options may be combined, as in
+.BR \-lic .
+.SH VIRTUALENVS
+.B activate
+.RI [ dir ]
+uses a virtualenv (by default
+.I .venv
+or
+.IR venv ),
+and
+.B deactivate
+leaves it.
+.B source \fIdir\fB/bin/activate
+does the same.
+The venv's commands go on
+.BR PATH ,
+and
+.B import
+uses its packages.
+A venv made for another Python minor version only changes
+.BR PATH ,
+and pysh says so.
 .SH CONFIGURATION
-.I ~/.pyshrc.py
-is ordinary Python run in the interactive namespace, so any of these can be set there:
+Every interactive shell runs
+.IR ~/.pyshrc ,
+a pysh script of shell and Python lines, in the shell's namespace.
+If there is none, pysh first writes a starter file that sets up coloured
+.B ls
+and lists the settings, commented out; an existing file is never overwritten.
+Everything it defines at the top level (imports, variables, functions, aliases) stays in the session.
+Set environment variables in
+.I ~/.pyshrc
+with
+.BR export ;
+a bare
+.B NAME=value
+line is Python.
+Indented Python blocks hold Python only; use
+.B os.environ
+there.
+An error is reported and the rest of the file still runs.
+It cannot import modules from the current directory.
+.B /etc/profile
+and
+.B ~/.profile
+are not read.
+These can be set there:
 .TP
 .B aliases["name"] = "command"
 Define aliases.
-Interactive shells start with
+The starter file aliases
 .B ls
-aliased to
+to
 .B "ls \-\-color=auto"
 when the system
 .B ls
-accepts that option; replace it, or
-.B del aliases["ls"]
-to remove it.
+accepts that option; change or delete those lines.
 .TP
-.B prompt
-A string, or a function returning one.
+.B PS1
+The prompt: a Python string (assign it, don't export it) with the fields
+.BR {venv} ", " {user} ", " {host} ", " {cwd} ", " {branch} " and " {status} ,
+and the colours
+.BR {red} ", " {green} ", " {yellow} ", " {blue} ", " {magenta} ", " {cyan} ", " {white} ", " {grey} ", " {bold} " and " {reset} .
+It may also be a function returning the finished prompt.
+bash escapes such as \eu are not understood.
 The default shows
 .BR user@host ,
 the full working directory (with your home shown as \fB~\fR), the git branch in white,
 and the status of the last command when it failed.
+A broken value is reported once and the default is used.
+A
+.B prompt
+string or function, if defined, takes precedence.
 .TP
 .B complete_ignore
 Tuple of file name suffixes never offered when completing command names
@@ -552,7 +630,7 @@ This lets you import a Cython module or helper file next to you, but a hostile m
 Set to
 .B False
 in
-.I ~/.pyshrc.py
+.I ~/.pyshrc
 to disable it for interactive sessions.
 .TP
 .B probe_flags
@@ -610,11 +688,12 @@ Arithmetic is signed 64-bit with wraparound, and brace expansion is limited to 1
 Text pasted with embedded newlines is run line by line; there is no bracketed paste.
 .SH FILES
 .TP
-.I ~/.pyshrc.py
-Python executed in the interactive namespace at startup.
-Define
-.B prompt
-(a string or a function returning one) to change the prompt.
+.I ~/.pyshrc
+Shell and Python lines run at interactive startup, like a script.
+Created with the default contents if missing.
+Set
+.B PS1
+there to change the prompt.
 .TP
 .I ~/.pysh_history
 Interactive history, one line per entry.
@@ -628,7 +707,7 @@ to stop
 searching the current directory (or a script's directory) in
 .BR \-c ,
 script and piped-input runs, where
-.I ~/.pyshrc.py
+.I ~/.pyshrc
 is not read.
 .TP
 .B PYSH_HOME

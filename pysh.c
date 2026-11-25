@@ -87,7 +87,7 @@ static int text_width(const char *s, int n) {
         else { i++; continue; }
         for (int k = 1; k < l && i + k < n; k++) cp = (cp << 6) | (s[i+k] & 63);
         i += l;
-        w += cpwidth(cp);
+        w += cp == '\n' || cp == '\t' ? 1 : cpwidth(cp);   /* a recalled block is drawn on one line: see out_line */
     }
     return w;
 }
@@ -111,6 +111,15 @@ static Py_ssize_t m_n;
 static int m_sel;
 static char m_tail[MAXLINE]; static int m_taillen;
 static char m_orig[MAXLINE]; static int m_origlen, m_origpos;
+
+/* the edit buffer as it is shown: a recalled multi-line entry stays on one line, newlines as U+23CE */
+static void out_line(const char *s, int n) {
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '\n') outs("\xe2\x8f\x8e");
+        else if (s[i] == '\t') outs(" ");
+        else out(s + i, 1);
+    }
+}
 
 /* display width of one UTF-8 sequence starting at p (advances *n bytes); control chars count as 1 ('?') */
 static int char_w(const char *p, int *n) {
@@ -215,7 +224,7 @@ static void redraw(const char *prompt, int pw, const char *buf, int len, int pos
     outs("\r"); outs(prompt);
     PyObject *h = g_highlight != Py_None ? PyObject_CallFunction(g_highlight, "s#", buf, (Py_ssize_t)len) : NULL;
     const char *hs = h && PyUnicode_Check(h) ? PyUnicode_AsUTF8(h) : NULL;
-    if (hs) outs(hs); else { PyErr_Clear(); out(buf, len); }
+    if (hs) outs(hs); else { PyErr_Clear(); out_line(buf, len); }
     Py_XDECREF(h);
     if (g_sug[0]) { outs("\x1b[90m"); outs(g_sug); outs("\x1b[0m"); }
     int tw = pw + text_width(buf, len) + (g_sug[0] ? text_width(g_sug, (int)strlen(g_sug)) : 0);
@@ -319,7 +328,7 @@ static void search_refresh(void *unused, const char *buf, int len) {
     m_sel = m_n ? 0 : -1;
 }
 
-/* readline(prompt, history, completer, suggest, highlight, search) -> str */
+/* readline(prompt, history, completer, suggest, highlight, search) -> str, or (str,) when Alt-E asks for an editor */
 static PyObject *le_readline(PyObject *self, PyObject *args) {
     const char *prompt; PyObject *hist, *comp;
     if (!PyArg_ParseTuple(args, "sOOOOO", &prompt, &hist, &comp, &g_suggest, &g_highlight, &g_search)) return NULL;
@@ -473,6 +482,14 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
             if (m_active && c1 == -1) {                       /* bare ESC cancels */
                 menu_close(); memcpy(buf, m_orig, m_origlen); len = m_origlen; pos = m_origpos;
                 break;
+            }
+            if (c1 == 'e') {                                  /* Alt-E: hand the line to $EDITOR (see read_entry) */
+                if (m_active) menu_close();
+                { PyObject *sv = g_suggest; g_suggest = Py_None; pos = len; REDRAW(); g_suggest = sv; }
+                outs("\r\n");
+                PyObject *text = PyUnicode_DecodeUTF8(buf, len, "replace");
+                if (text) { result = PyTuple_Pack(1, text); Py_DECREF(text); }
+                goto done;
             }
             if (c1 == 'b') { pos = word_back(buf, pos); break; }
             if (c1 == 'f') { if (pos == len && g_sug[0]) ins(buf, &len, &pos, g_sug, word_fwd(g_sug, strlen(g_sug), 0)); else pos = word_fwd(buf, len, pos); break; }

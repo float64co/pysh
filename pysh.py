@@ -1,5 +1,5 @@
 # pysh -- embedded shell logic.  Executed by pysh.c inside __main__.
-import ast, builtins, codeop, glob, importlib, inspect, io, keyword, operator, os, re, shutil, signal, site, subprocess, sys, tempfile, threading, time, traceback, types
+import ast, builtins, codeop, glob, importlib, inspect, io, keyword, operator, os, re, shlex, shutil, signal, site, subprocess, sys, tempfile, threading, time, traceback, types
 
 VERSION = "0.1"
 shell = sys.modules["__main__"]                # pysh's own internals: shell.jobs, shell.history, ...
@@ -712,6 +712,7 @@ Editing keys:
   Right / End / Ctrl-F   accept the grey autosuggestion (Alt-F: one word)
   Up / Down              search history for entries starting with what you typed
   Ctrl-R                 history search menu (Enter inserts, Esc cancels)
+  Alt-E                  edit the line in $EDITOR (default vim); save and quit to run it
   Tab / Shift-Tab        complete; again to cycle the menu (Enter runs it)
   Ctrl-A/E/K/U/W/L/D     start, end, kill to end, kill line, kill word, clear, delete
   Alt-B / Alt-F          move by word
@@ -1493,6 +1494,10 @@ _PYTOK = re.compile(r"""(?P<str>(?:[rbfRBF]{0,2})(?:\"\"\"[\s\S]*?(?:\"\"\"|$)|'
 C = lambda n, t: f"\x1b[{n}m{t}\x1b[0m"
 
 def highlight(buf):
+    """Colour the edit buffer. A recalled multi-line entry is shown on one line (same widths as the C editor uses)."""
+    return _highlight(buf).replace("\n", "\u23ce").replace("\t", " ")
+
+def _highlight(buf):
     buf = _CTRL.sub("?", buf)                 # same width, so the cursor math still holds
     m = re.match(r"(\s*)%", buf)
     if m: return m.group(1) + C(90, "%") + highlight_sh(buf[m.end():])
@@ -1686,11 +1691,24 @@ def search_history(query):
         if len(out) >= 200: break
     return out
 
+# One entry per line in the file. An entry with several lines is written with a leading \x1e and
+# its newlines escaped; single-line entries are stored as they are.
+_HIST_MULTI = "\x1e"
+_HIST_ESCAPES = {"\\": "\\\\", "\n": "\\n", "\r": "\\r"}
+
+def _history_encode(entry):
+    if not any(c in entry for c in "\n\r") and not entry.startswith(_HIST_MULTI): return entry
+    return _HIST_MULTI + "".join(_HIST_ESCAPES.get(c, c) for c in entry)
+
+def _history_decode(line):
+    if not line.startswith(_HIST_MULTI): return line
+    return re.sub(r"\\([\\nr])", lambda m: {"n": "\n", "r": "\r"}.get(m.group(1), "\\"), line[1:])
+
 def load_history():
     try:
         st = os.stat(HIST)
         if st.st_uid == os.getuid() and st.st_mode & 0o077: os.chmod(HIST, 0o600)       # it may hold secrets
-        with open(HIST) as f: history.extend(l.rstrip("\n") for l in f if l.strip())
+        with open(HIST) as f: history.extend(_history_decode(l.rstrip("\n")) for l in f if l.strip())
     except OSError: pass
 
 def save_history(line):
@@ -1699,39 +1717,95 @@ def save_history(line):
         history.append(line)
         try:
             fd = os.open(HIST, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            with os.fdopen(fd, "a") as f: f.write(line + "\n")
+            with os.fdopen(fd, "a") as f: f.write(_history_encode(line) + "\n")
         except OSError: pass
+
+class Block(str):
+    """An entry that came back from the editor, or several lines recalled from history: run as a script."""
+
+class _EditRequest(Exception):
+    def __init__(self, text): self.text = text
+
+def run_block(src):
+    if "\n" not in src: return run_line(src)
+    if classify(src.split("\n", 1)[0]) == "py":
+        try: compile(preprocess(src) + "\n", "<pysh>", "single")       # one Python statement: echo values, as typed
+        except (SyntaxError, ValueError): pass
+        else: return run_python(src)
+    return run_script(src)
+
+def edit_in_editor(text):
+    """Alt-E: edit `text` in $EDITOR (default vim). -> the Block to run, or "" to run nothing.
+    It runs only if the file was saved, so quitting without writing (`:q!`) is a way out."""
+    try: argv = shlex.split(os.environ.get("EDITOR") or "vim") or ["vim"]
+    except ValueError as e: sh_error(f"$EDITOR: {e}"); return ""
+    argv[0] = os.path.expanduser(argv[0])
+    fd, path = tempfile.mkstemp(prefix="pysh-edit-", suffix=".pysh")
+    keep, result = False, ""
+    try:
+        with os.fdopen(fd, "w") as f: f.write(text + "\n" if text else "")
+        os.utime(path, ns=(0, 0))                                  # any write now shows, however quick
+        stage = Stage()
+        stage.words = [[("sq", a)] for a in argv + [path]]          # quoted: no aliases, globs or expansion
+        r = run_pipeline([stage], cmdline=" ".join(argv))
+        if r.returncode == 148:
+            keep = True; sh_error(f"editor stopped; nothing run (your text is in {path})")
+        elif r.returncode != 0:
+            sh_error(f"editor exited with status {r.returncode}; nothing run")
+        elif os.stat(path).st_mtime_ns != 0:
+            with open(path, errors="replace") as f: new = f.read().replace("\r\n", "\n")
+            new = re.sub(r"\A(?:[ \t]*\n)+", "", new).rstrip()
+            if new.strip(): result = Block(new)
+    except OSError as e:
+        sh_error(f"edit: {e}")
+    finally:
+        if not keep:
+            try: os.unlink(path)
+            except OSError: pass
+    if result:
+        for line in result.split("\n"): print("\x1b[90m\u2026\x1b[0m " + clean(line.replace("\t", "    ")))
+    elif text.strip():
+        save_history(text)                                         # don't lose what had been typed: Up brings it back
+    return result
 
 def read_entry(tty):
     """Read one logical entry (with continuation handling)."""
     import _pyshline
+    lines = []
     def rl(p):
-        if tty: return _pyshline.readline(p, history, complete, suggest, highlight, search_history)
+        if tty:
+            got = _pyshline.readline(p, history, complete, suggest, highlight, search_history)
+            if isinstance(got, tuple): raise _EditRequest(got[0])
+            return got
         sys.stdout.flush()
         l = sys.stdin.readline()
         if not l: raise EOFError
         return l.rstrip("\n")
-    if INTERACTIVE: reap_jobs(notify=True)
-    _cmdcache.clear()
-    older = ns.get("prompt")                         # a `prompt` string or function still wins over PS1
-    text = prompt() if older is None else str(older() if callable(older) else older)
-    above, newline, text = text.rpartition("\n")    # the line editor draws one line; print any earlier ones first
-    if newline: print(above, flush=True)
-    first = rl(text)
-    if not first.strip(): return first
-    lines = [first]
-    while True:
-        src = "\n".join(lines)
-        if src.endswith("\\"): lines[-1] = lines[-1][:-1]; lines.append(rl("\x1b[90m…\x1b[0m ")); continue
-        if classify(lines[0]) != "py":
-            if split_heredocs(src)[2]: break                         # here-document still open?
-            lines.append(rl("\x1b[90m…\x1b[0m ")); continue
-        try: code = codeop.compile_command(preprocess(src), "<pysh>", "single")
-        except SyntaxError: break
-        if code is not None and not (len(lines) > 1 and lines[-1].strip()): break
-        if code is not None and len(lines) == 1 and not first.rstrip().endswith(":"): break
-        lines.append(rl("\x1b[90m…\x1b[0m "))
-    return "\n".join(lines)
+    try:
+        if INTERACTIVE: reap_jobs(notify=True)
+        _cmdcache.clear()
+        older = ns.get("prompt")                         # a `prompt` string or function still wins over PS1
+        text = prompt() if older is None else str(older() if callable(older) else older)
+        above, newline, text = text.rpartition("\n")    # the line editor draws one line; print any earlier ones first
+        if newline: print(above, flush=True)
+        first = rl(text)
+        if "\n" in first: return Block(first)                       # several lines recalled from history
+        if not first.strip(): return first
+        lines.append(first)
+        while True:
+            src = "\n".join(lines)
+            if src.endswith("\\"): lines[-1] = lines[-1][:-1]; lines.append(rl("\x1b[90m…\x1b[0m ")); continue
+            if classify(lines[0]) != "py":
+                if split_heredocs(src)[2]: break                         # here-document still open?
+                lines.append(rl("\x1b[90m…\x1b[0m ")); continue
+            try: code = codeop.compile_command(preprocess(src), "<pysh>", "single")
+            except SyntaxError: break
+            if code is not None and not (len(lines) > 1 and lines[-1].strip()): break
+            if code is not None and len(lines) == 1 and not first.rstrip().endswith(":"): break
+            lines.append(rl("\x1b[90m…\x1b[0m "))
+        return "\n".join(lines)
+    except _EditRequest as e:
+        return edit_in_editor("\n".join(lines + [e.text]))
 
 DEFAULT_RC = """\
 # ~/.pyshrc - run by every interactive pysh. pysh created this file because it didn't exist; edit it freely.
@@ -1755,7 +1829,7 @@ del _ls
 PS1 = "@PS1@"
 
 # Examples
-# export EDITOR=vim
+# export EDITOR=nano                       # Alt-E opens $EDITOR (default vim)
 # export PATH=~/bin:$PATH
 # alias ll='ls -l'
 # def PS1(): return $(date +%H:%M) + " > "        # a function can compute anything
@@ -1802,6 +1876,7 @@ def repl(interactive=False, norc=False):
     if tty:
         init_job_control()
         load_history()
+        os.environ.setdefault("EDITOR", "vim")                      # Alt-E, git and friends; ~/.pyshrc can change it
     if (tty or interactive) and not norc:
         try: run_rc(create=tty)
         except SystemExit as e: hup_jobs(); return exit_status(e)        # `exit` in an rc file leaves, as in bash
@@ -1822,7 +1897,7 @@ def repl(interactive=False, norc=False):
         if not line.strip(): continue
         if tty: save_history(line)
         _exit_warned = False if not line.strip().startswith(("exit", "quit")) else _exit_warned
-        try: run_line(line)
+        try: run_block(line) if isinstance(line, Block) else run_line(line)
         except SystemExit as e: hup_jobs(); return exit_status(e)
         except KeyboardInterrupt: print()
         except Exception as e:

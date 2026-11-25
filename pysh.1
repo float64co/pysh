@@ -507,6 +507,13 @@ Python attributes by type, and options by parsing
 .B Ctrl\-D
 .B Alt\-B
 .BR Alt\-D .
+.TP
+.B Alt\-E
+Edit the line, and any continuation lines already typed, in
+.BR $EDITOR " (default " vim ).
+If you save, the result is shown and run at once, like a script.
+Quitting without saving, saving an empty file or a failing editor runs nothing.
+Up arrow shows a recalled multi\-line entry on one line, with a return symbol at each line break.
 .SH OPTIONS
 .TP
 .B \-c \fIcommand\fR

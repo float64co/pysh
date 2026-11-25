@@ -165,8 +165,23 @@ supports `--help`.
   Python attributes by type, flags parsed from `cmd --help`. Tab cycles, Enter runs the selection, Esc cancels.
 - **Pasting**: text that arrives in one go (a paste, or typing ahead while a command runs) is inserted in one step and repainted once, so large pastes are fast.
 - **`Ctrl-R`** history search menu; `↑`/`↓` search history by prefix.
+- **`Alt-E`** edits the line in your editor, for anything longer than a line. See below.
 - **Colored `ls`**: interactive shells alias `ls` to `ls --color=auto` when your `ls` supports it (set up by the starter `~/.pyshrc`; edit or delete it there).
 - **Prompt**: `user@host ~/src/c/pysh(branch)>`, with the git branch in white.
+
+## Editing in your editor
+
+pysh edits one line at a time. For a loop or a function, press `Alt-E`: the line (with any continuation lines
+already typed) opens in `$EDITOR`, which is `vim` unless you set it otherwise.
+
+- **Save and quit** and the block is shown and run at once. It runs like a script, so shell and Python lines
+  can be mixed. A single Python statement still prints its values, as if typed.
+- **Quit without saving** (`:q!`), save an empty file, or have the editor fail, and nothing runs. What you had
+  typed stays in history.
+- `↑` brings a block back on one line, with `⏎` marking each line break. Press Enter to run it again, or
+  `Alt-E` to edit it. Blocks are kept in history across sessions.
+
+For an editor that returns immediately, use its waiting option, e.g. `export EDITOR="code --wait"`.
 
 ## Security notes
 

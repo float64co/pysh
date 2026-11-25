@@ -486,6 +486,44 @@ is written out by the rules above:
 .fi
 .RE
 .PP
+A first stage written
+.BI @( expression )
+is evaluated inside the pipeline, so what it prints goes down the pipe along with what it returns:
+.PP
+.RS
+.nf
+p = lambda x: print(pprint.pformat(x))
+@(p(repo)) | less
+p(repo) | less
+.fi
+.RE
+.PP
+The
+.B @( )
+may be left off, as in the last line, when what follows a
+.B |
+is a command Python could not use there:
+a name not defined in Python that is a program; a path
+.RB ( /usr/bin/less ", " ./filter ", " ~/bin/x );
+.BR $PAGER " or " "$(which less)" ;
+.BR "VAR=x cmd" ;
+.BR \eless ;
+a
+.BI @ stage
+or a
+.IB name =@
+capture.
+A quoted name does not count.
+.B "flags | mask"
+and
+.B "a | sorted"
+remain Python.
+A redirection alone is not enough;
+.B "p(repo) > out.txt"
+is a comparison.
+.B %
+forces the shell reading as usual.
+.PP
 A line that begins with
 .B @
 is a Python decorator unless it has a

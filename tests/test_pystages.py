@@ -395,6 +395,114 @@ class Source(Case):
             """, "spliced words\n")
 
 
+class PrintingSource(Case):
+    """A source `@(...)` runs inside its stage, so what it prints goes down the pipe."""
+    SETUP = "import pprint\np = lambda x: print(pprint.pformat(x))\nrepo = {'name': 'cpython'}\n"
+
+    def go(self, script, expected):
+        self.check(self.SETUP + textwrap.dedent(script), expected)
+
+    def test_printed_output_reaches_the_pipe(self):
+        self.go("@(p(repo)) | tr a-z A-Z\n", "{'NAME': 'CPYTHON'}\n")
+        self.go("@(p(repo)) > o.txt\necho saved\ncat o.txt\n", "saved\n{'name': 'cpython'}\n")
+        self.go("@(print('printed') or 'returned') | cat\n", "printed\nreturned")
+
+    def test_evaluated_exactly_once(self):
+        self.go("""
+            def once():
+                with open("count", "a") as f: f.write("x")
+                return "v"
+            @(once()) | cat
+            echo
+            cat count
+            """, "v\nx")
+
+    def test_a_failing_source_leaves_captures_alone_and_shows_the_users_frames(self):
+        r = self.sh("def f():\n    raise ValueError('inner')\nout = 'old'\n@(f()) | out=@lines\nprint(out, last.returncode)\n")
+        self.assertEqual(r.stdout, "old 1\n", r.stderr)
+        self.assertIn("ValueError: inner", r.stderr)
+        self.assertNotIn("_evaluate", r.stderr); self.assertNotIn("_run_function", r.stderr)
+
+
+class BarePythonSource(Case):
+    """`p(repo) | less` without `@(...)`: a pipeline only when, as Python, it could only be a NameError."""
+    SETUP = "import pprint\np = lambda x: print(pprint.pformat(x))\nrepo = {'name': 'cpython'}\n"
+
+    def go(self, script, expected):
+        self.check(self.SETUP + textwrap.dedent(script), expected)
+
+    def test_calls_variables_and_expressions(self):
+        self.go("p(repo) | tr a-z A-Z\n", "{'NAME': 'CPYTHON'}\n")
+        self.go("repo | grep -o cpython\n", "cpython\n")
+        self.go("[3, 1, 2] | sort\n", "1\n2\n3\n")
+        self.go("sorted(repo) | paste -sd,\n", "name\n")
+        self.go("print('a b') | wc -w\n", "2\n")
+        self.go("(c for c in 'ba') | sort | head -1\n", "a\n")
+        self.go("repo['name'] | tr c C\n", "Cpython")
+        self.go("repo.keys | @(lambda f: f.read())\n", "dict_keys(['name'])\n")
+        self.go("[x * 2 for x in range(3)] | tail -1\n", "4\n")
+
+    def test_with_captures_stages_and_operators(self):
+        self.go("p(repo) | out=@lines\nprint(out)\n", """["{'name': 'cpython'}"]\n""")
+        self.go("p(repo) | @(lambda f: len(f.read()))\n", "20\n")
+        self.go("p(repo) | grep zzz || echo none\n", "none\n")
+        self.go("p(repo) | cat && echo done\n", "{'name': 'cpython'}\ndone\n")
+        self.go("p(repo) |& cat; echo next\n", "{'name': 'cpython'}\nnext\n")
+        self.go("print(!(repo | tr c C).out.strip())\n", "{'name': 'Cpython'}\n")
+        self.go("def f():\n    mine = 'local'\n    return !(mine | cat).out\nprint(f())\n", "local\n")
+
+    def test_other_spellings_of_the_program(self):
+        with open(os.path.join(self.d, "mine"), "w") as f: f.write("#!/bin/sh\ntr a-z A-Z\n")
+        os.chmod(os.path.join(self.d, "mine"), 0o755)
+        for spelling in ("/usr/bin/tr a-z A-Z", "/bin/cat | ./mine", "./mine", f"../{os.path.basename(self.d)}/mine", "~/mine",
+                         "$UPPER", "$(echo ./mine)", "LC_ALL=C tr a-z A-Z", "\\tr a-z A-Z", "tr a-z A-Z | /bin/cat"):
+            with self.subTest(spelling=spelling):
+                self.go(f"export UPPER=./mine\np(repo) | {spelling}\n", "{'NAME': 'CPYTHON'}\n")
+
+    def test_a_path_that_does_not_exist_is_a_missing_command(self):
+        r = self.sh(self.SETUP + "p(repo) | /no/such/pager\n")
+        self.assertIn("/no/such/pager: command not found", r.stderr)
+        self.assertNotIn("p(repo): command not found", r.stderr)
+
+    def test_python_operators_that_look_similar_stay_python(self):
+        self.go("""
+            a = 6; b = 3
+            print(a | ~b)
+            print(a | .5.__int__())
+            print(a | b == 7, a | b != 7, a | b <= 7)
+            c = a | b
+            c |= 8
+            print(c, a | $((4)))
+            """, "-2\n6\nTrue False True\n15 6\n")
+
+    def test_python_stays_python_when_names_are_defined(self):
+        self.go("""
+            flags = 5; mask = 3
+            flags | mask
+            print(flags | mask)
+            x = {1} | {2}
+            print(x)
+            def less(v): return v
+            y = flags | less(mask)
+            print(y)
+            """, "7\n{1, 2}\n7\n")
+        r = self.sh("a = 1\na | no_such_thing_anywhere\n")
+        self.assertIn("NameError", r.stderr)
+
+    def test_shell_pipelines_are_untouched(self):
+        self.go("""
+            echo hi | cat
+            id | cut -c1-4
+            printf 'b\\na\\n' | sort | head -1
+            sh | cat < /dev/null
+            echo end
+            """, "hi\nuid=\na\nend\n")
+
+    def test_percent_forces_the_shell_reading(self):
+        r = self.sh("repo = 1\n% repo | cat\n")
+        self.assertIn("repo: command not found", r.stderr)
+
+
 class PipeFail(Case):
     def test_off_by_default(self):
         self.check("false | true\nprint(last.returncode)\nfalse | @(lambda f: None)\nprint(last.returncode)\n", "0\n0\n")
@@ -440,7 +548,7 @@ class PipeFail(Case):
         s.send("set_pipefail = True\r", 0.5)
         s.send("sh -c 'exit 7' | cat\r", 1.0)
         self.assertIn("[7]>", s.text())
-        s.send("sh -c 'exit 8' | cat &\r", 1.0); s.send("wait\r", 1.0)
+        s.send("sh -c 'sleep 2; exit 8' | cat &\r", 0.5); s.send("wait\r", 3.0)     # still running when `wait` starts
         self.assertIn("[8]>", s.text())
 
 

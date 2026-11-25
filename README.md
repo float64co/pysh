@@ -242,6 +242,24 @@ rows = ["pear", "apple"]
 @(df.to_csv()) | wc -l
 ```
 
+A first stage written `@(...)` is evaluated inside the pipeline, so both what it **prints** and what it returns go
+down the pipe:
+
+```python
+p = lambda x: print(pprint.pformat(x))            # after: import pprint
+@(p(repo)) | less
+p(repo) | less                                    # the same, without @( )
+repo | grep stars
+```
+
+The `@( )` can be left off when what follows a `|` is a command that Python couldn't use there: a name that is
+**not defined in Python but is a program**, a path (`/usr/bin/less`, `./filter`, `~/bin/x`), `$PAGER` or
+`$(which less)`, `VAR=x cmd`, `\less`, a `@stage` or a `name=@` capture. (A quoted `"less"` doesn't count.)
+So `flags | mask` and
+`a | sorted` are still Python. If you later define a variable called `less`, `p(repo) | less` becomes Python
+too; `@(...)` always means a pipeline. A redirection alone doesn't count: `p(repo) > out.txt` is a Python
+comparison, so write `@(p(repo)) > out.txt`.
+
 A line that starts with `@` is a decorator unless it has a `|`, `<` or `>` outside brackets (or words after
 `@(...)`), so `@property` and `@lru_cache(maxsize=2)` are unaffected.
 

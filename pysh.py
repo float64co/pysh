@@ -1349,6 +1349,11 @@ def plan_stages(pipe):
             nodes.append(_Node(st, "tap", show=True, env=env)); special = True
             continue
         at = _AT_NAME.match(first_text) if single and first_kind == "lit" else None
+        if (single and first_kind == "py" and i == 0 and len(words) == 1 and not _has_input(st)
+                and (len(pipe) > 1 or _has_output(st))):
+            # `@(...) | cmd`: always a source.  Evaluate it inside the stage, where print() reaches the pipe.
+            nodes.append(_Node(st, "expr", expr=first_text, label=f"@({first_text})", source=True, env=env)); special = True
+            continue
         if at or (single and first_kind == "py" and (len(pipe) > 1 or st.redirs)):
             obj = _lookup(at.group(1)) if at else _evaluate(first_text)
             label = first_text if at else f"@({first_text})"
@@ -1425,6 +1430,9 @@ def _run_function(node, in_fd, out):
                 rc, produced = run_inproc(lambda: node.fn(node.argv[1:]), True, text)
                 out.write(produced or ""); return rc, None
             if node.kind == "data": value = node.value
+            elif node.kind == "expr":
+                value = _evaluate(node.expr)
+                if callable(value): value = value()
             else: value = node.fn(*([] if stream is None else [stream]), *node.args)
             if node.name:
                 if isinstance(value, collections.abc.Iterator): value = list(value)    # while the input is still open
@@ -1433,7 +1441,12 @@ def _run_function(node, in_fd, out):
     except (SystemExit, KeyboardInterrupt): raise
     except BrokenPipeError: raise
     except Exception as e:
-        traceback.print_exception(type(e), e, e.__traceback__.tb_next)
+        tb = e.__traceback__.tb_next
+        if node.kind == "expr":                                    # skip _evaluate and the eval frame: show the user's code
+            if tb is not None: tb = tb.tb_next
+            while tb is not None and tb.tb_next is not None and tb.tb_frame.f_code.co_filename == "<string>" and tb.tb_frame.f_code.co_name == "<module>":
+                tb = tb.tb_next
+        traceback.print_exception(type(e), e, tb)
         _call_hint(node, e)
         return 1, None
     finally:
@@ -1564,7 +1577,7 @@ def run_python_pipeline(nodes, capture, capture_err, background, cmdline, tee, s
         raise SyntaxError("captures and name=@... can't be used with & or ![...]")
     final = nodes[-1]
     # The last stage stays in the shell if it is Python or a capture, unless the shell must not block on it.
-    here = final.kind != "cmd" and not background and not stream and not (final.kind == "data")
+    here = final.kind not in ("cmd", "data", "expr") and not background and not stream
     threads_needed = any(n.kind == "tap" for n in nodes[:-1])
     use_jobs = background or (INTERACTIVE and not capture and not capture_err and not stream and not tee
                               and not here and not threads_needed)
@@ -1731,8 +1744,11 @@ def run_python_pipeline(nodes, capture, capture_err, background, cmdline, tee, s
 def run_shell(line, capture=False, capture_err=False, tee=False, stream=False, timeout=None, merge=False):
     global last
     line = line.lstrip()
+    original = line
     if line.startswith("%"): line = line[1:]              # `% cmd` forces shell mode
+    forced = line != original
     line, bodies, _ = split_heredocs(line)
+    if not forced: line = _python_source(line) or line
     try: items = parse(line, bodies)
     except SyntaxError as e: sh_error(f"syntax error: {e.msg if hasattr(e,'msg') and e.msg else e}"); _setlast(Result(2, cmd=line)); return last
     if stream and (len(items) != 1 or items[0][1] == "&"):
@@ -1865,6 +1881,65 @@ def _splice_with_words(s):
     except SyntaxError: return False
     return bool(rest[:1].isspace() and rest.strip() and not rest.strip().startswith(("#", ".", "(", "[")))
 
+def _first_pipeline(s):
+    """split at top-level `|` up to the first `;`, `&&`, `||` or `&` -> list of segment strings"""
+    parts, depth, start, i, n = [], 0, 0, 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in "'\"":
+            j = i + 1
+            while j < n and s[j] != c: j += 2 if s[j] == "\\" else 1
+            i = j
+        elif c in "([{": depth += 1
+        elif c in ")]}": depth -= 1
+        elif c == "#": break
+        elif depth <= 0 and (c == ";" or s[i:i+2] in ("&&", "||") or (c == "&" and s[i-1:i] not in ("|", ">", "<") and s[i+1:i+2] != ">")):
+            break
+        elif depth <= 0 and c == "|" and s[i+1:i+2] != "=":
+            parts.append(s[start:i])
+            if s[i+1:i+2] == "&": i += 1
+            start = i + 1
+        i += 1
+    parts.append(s[start:i])
+    return parts
+
+# A segment starting like this is a command, never a Python operand: a path (/usr/bin/less, ./x, ../x, ~/x),
+# \less, VAR=x cmd (and name=@...), a @stage, or $PAGER / $(which less) (a string, which `|` can't take).
+_SURELY_COMMAND = re.compile(r"/|\.\.?/|~[\w-]*/|\\|\$(?!\(\()|@|[A-Za-z_]\w*=(?![=\s])")
+
+def _python_source(line):
+    """`p(repo) | less`: Python piped into a program.  Read it that way only when what follows a `|` is a command
+    Python could not use there: a name that is not defined but is a program, or a form in _SURELY_COMMAND.
+    -> the line rewritten as `@(...) | ...`, or None."""
+    parts = _first_pipeline(line)
+    if len(parts) < 2: return None
+    g, l = _scope()
+    def bound(name): return name in l or name in g or hasattr(builtins, name)
+    offset = len(parts[0])
+    for part in parts[1:]:
+        if _SURELY_COMMAND.match(part.lstrip("&").lstrip()): break
+        word = re.match(r"&?\s*([^\s;&|<>()'\"]*)", part)
+        w, after = word.group(1), part[word.end():]
+        if (w and re.fullmatch(r"[A-Za-z_][\w.+-]*", w) and not after.startswith("(")
+                                 and not bound(w) and not keyword.iskeyword(w) and (w in aliases or w in BUILTINS or is_command(w))):
+            break
+        offset += 1 + len(part)
+    else:
+        return None
+    left, rest = line[:offset].strip(), line[offset:]
+    try:
+        expr = preprocess(left)
+        tree = ast.parse(expr, mode="eval").body
+    except (SyntaxError, ValueError, RecursionError): return None
+    if isinstance(tree, ast.Constant): return None                       # `'my tool' | less` names a program
+    if isinstance(tree, ast.Name) and (not (tree.id in l or tree.id in g) or is_command(tree.id)): return None
+    own = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and not isinstance(n.ctx, ast.Load)}
+    own |= {n.arg for n in ast.walk(tree) if isinstance(n, ast.arg)}
+    if any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in own and not bound(n.id)
+           and not n.id.startswith("__") for n in ast.walk(tree)):
+        return None
+    return f"@({expr}) {rest}"
+
 def classify(line):
     s = line.strip()
     m = re.match(r"[^\s|&;<>()=]+", s)
@@ -1875,6 +1950,7 @@ def classify(line):
         return "sh" if _has_pipe_or_redirect(s) or _splice_with_words(s) else "py"
     if kw and kw.group() in KW and not (kw.group() in BUILTINS): return "py"
     if w in BUILTINS and w not in ns and not s[len(w):].lstrip().startswith(("(", "=", ".", "[")): return "sh"
+    if _python_source(s): return "sh"                  # `p(repo) | less`
     try: py = preprocess(s)
     except SyntaxError: return "sh"                    # e.g. an unbalanced $( : the shell parser reports it
     try: code = codeop.compile_command(py, "<pysh>", "single")

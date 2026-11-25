@@ -377,10 +377,36 @@ def split_heredocs(text):
         bodies.append(("".join(b + "\n" for b in body), quoted))
     return first, bodies, complete
 
+def expand_aliases(toks):
+    """Replace a string alias wherever a command starts: the beginning of the line and after ; & && || | |&
+    (leading `NAME=value` words and redirections don't count). Quoted or escaped names (`\\ls`, `'ls'`) are
+    left alone, and an alias is never expanded again inside its own expansion (`alias ls='ls --color'`).
+    As in bash, a value ending in a blank makes the following word a candidate too (`alias sudo='sudo '`)."""
+    out, queue = [], [(t, frozenset()) for t in toks]
+    at_command, is_target = True, False
+    while queue:
+        t, inside = queue.pop(0)
+        if t is None: at_command = True                     # end of an alias that ended in a blank
+        elif t[0] == "w":
+            if is_target: is_target = False
+            elif at_command:
+                kind, text = t[1][0]
+                if kind == "lit" and re.match(r"[A-Za-z_]\w*=", text): pass          # VAR=x cmd
+                elif len(t[1]) == 1 and kind == "lit" and text not in inside and isinstance(aliases.get(text), str):
+                    value = aliases[text]
+                    more = [(None, inside)] if value.endswith((" ", "\t")) else []
+                    queue[:0] = [(x, inside | {text}) for x in tokenize(value)] + more
+                    continue
+                else: at_command = False
+        elif t[0] == "redir": is_target = True
+        elif t[0] == "op": at_command = True
+        if t is not None: out.append(t)
+    return out
+
 def parse(line, heredocs=None):
     """-> list of (pipeline:list[Stage], terminator: ';' '&&' '||' '&' '')"""
     heredocs = iter(heredocs or [])
-    toks = tokenize(line)
+    toks = expand_aliases(tokenize(line))
     out, pipe, st, i = [], [], Stage(), 0
     while i < len(toks):
         t = toks[i]
@@ -1186,18 +1212,11 @@ def run_inproc(fn, capture, stdin_text=None):
         r = 0
     return (r if isinstance(r, int) else 0), (buf.getvalue() if capture else None)
 
-def expand_alias(line):
-    m = re.match(r"\s*((?:[A-Za-z_]\w*=(?:\"[^\"]*\"|'[^']*'|[^\s|&;<>])*\s+)*)([^\s|&;<>]+)", line)   # skip leading FOO=bar words
-    if m and isinstance(aliases.get(m.group(2)), str):
-        return line[:m.start(2)] + aliases[m.group(2)] + line[m.end(2):]
-    return line
-
 def run_shell(line, capture=False, capture_err=False, tee=False, stream=False, timeout=None, merge=False):
     global last
     line = line.lstrip()
     if line.startswith("%"): line = line[1:]              # `% cmd` forces shell mode
     line, bodies, _ = split_heredocs(line)
-    line = expand_alias(line)
     try: items = parse(line, bodies)
     except SyntaxError as e: sh_error(f"syntax error: {e.msg if hasattr(e,'msg') and e.msg else e}"); _setlast(Result(2, cmd=line)); return last
     if stream and (len(items) != 1 or items[0][1] == "&"):

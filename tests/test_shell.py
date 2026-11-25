@@ -672,3 +672,76 @@ class AssignmentExpansion(Base):
 
     def test_ordinary_arguments_are_unchanged(self):
         self.check('export V="a b"\nprintf "<%s>" $V a=~/z\n', "<a><b><a=~/z>")
+
+
+class AliasPositions(Base):
+    """String aliases expand wherever a command starts, not only at the beginning of the line."""
+    SETUP = "alias hi='echo HI'\n"
+
+    def lines(self, script):
+        r = run(self.SETUP + script + "\n", mode="stdin")
+        return r.out.split("\n")[:-1], r.err
+
+    def check(self, script, *expected):
+        out, err = self.lines(script)
+        self.assertEqual((out, err), (list(expected), ""), msg=script)
+
+    def test_after_each_separator(self):
+        self.check("true; hi", "HI")
+        self.check("true && hi", "HI")
+        self.check("false || hi", "HI")
+        self.check("echo x | hi", "HI")
+        self.check("echo x |& hi", "HI")
+        self.check("hi & wait", "HI")
+        self.check("hi; hi && hi", "HI", "HI", "HI")
+
+    def test_arguments_follow_the_alias(self):
+        self.check("true && hi there", "HI there")
+
+    def test_after_assignments_and_redirections(self):
+        self.check("true; X=1 hi", "HI")
+        self.check("true; </dev/null hi", "HI")
+
+    def test_arguments_and_quoted_text_are_left_alone(self):
+        self.check("echo hi", "hi")
+        self.check("echo 'a; hi' \"b && hi\"", "a; hi b && hi")
+        self.check("echo a\\; hi", "a; hi")
+        self.check("echo > hi; cat hi; rm hi", "")                     # a redirect target is not a command
+
+    def test_quoting_the_name_skips_the_alias(self):
+        out, err = self.lines("true; \\hi")
+        self.assertIn("hi: command not found", err)
+        out, err = self.lines("true; 'hi'")
+        self.assertIn("hi: command not found", err)
+
+    def test_self_reference_expands_once(self):
+        self.check("alias echo='echo pre'\ntrue && echo x; echo y", "pre x", "pre y")
+
+    def test_mutual_reference_terminates(self):
+        out, err = self.lines("alias a=b\nalias b=a\ntrue; a")
+        self.assertIn("a: command not found", err)
+
+    def test_alias_of_an_alias_and_of_several_commands(self):
+        self.check("alias yo=hi\nalias both='hi; yo'\ntrue && both", "HI", "HI")
+        self.check("alias count='printf x | wc -c'\ntrue; count", "1")
+
+    def test_in_command_substitution_and_scripts(self):
+        self.check("x = $(true; hi)\nprint(x)", "HI")
+        r = run("alias hi='echo HI'\ntrue && hi\n")
+        self.assertEqual(r.out, "HI\n", msg=repr(r))
+
+    def test_trailing_blank_expands_the_next_word_too(self):
+        self.check("alias say='echo '\nsay hi", "echo HI")             # "hi" is expanded because `say` ends in a blank
+        self.check("alias say='echo'\nsay hi", "hi")                   # ...and not without it
+        self.check("alias run='env '\ntrue && run hi", "HI")            # the sudo case, with env
+        self.check("alias run='env\t'\nrun hi", "HI")
+
+    def test_trailing_blank_reaches_only_the_next_word(self):
+        self.check("alias say='echo '\nsay x hi", "x hi")
+        self.check("alias say='echo '\nsay 'hi'", "hi")                # quoted: left alone
+        self.check("alias say='echo '\nsay x; echo hi", "x", "hi")
+
+    def test_trailing_blank_chains_and_terminates(self):
+        self.check("alias run='env '\nrun run hi", "HI")                # each word typed by you is expanded afresh
+        self.check("alias echo='echo '\necho echo z", "echo z")
+        self.check("alias a='echo '\nalias b='c '\nalias c='b '\na b", "b")

@@ -65,6 +65,8 @@ The shell side has pipes (`|`, and `|&` to include stderr), `&& || ; &`, redirec
 (`{a,b}`, `{1..10..2}`, `{01..12}`), arithmetic (`$((1 + 2 * $X))`), here-documents
 (`<<EOF`, `<<-EOF`, `<<'EOF'`) and here-strings (`<<< text`). There are no shell loops or
 functions; use Python.
+Aliases expand wherever a command starts, including after `;`, `&&`, `||` and `|`; `\ls` skips one. An alias ending in a space also expands the
+word after it: with `alias sudo='sudo '`, `sudo ll` works.
 Builtins: `cd pwd exit export unset alias unalias jobs fg bg wait kill source history type help`.
 
 ### Forcing shell mode with `%`

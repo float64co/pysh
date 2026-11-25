@@ -583,6 +583,15 @@ These can be set there:
 .TP
 .B aliases["name"] = "command"
 Define aliases.
+An alias is expanded wherever a command starts: at the beginning of a line and after
+.BR "; & && || |" .
+Quote or escape the name
+.RB ( \els )
+to skip it.
+If an alias ends in a blank, the word after it is expanded too, so
+.B "alias sudo='sudo '"
+lets an alias follow
+.BR sudo .
 The starter file aliases
 .B ls
 to

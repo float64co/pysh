@@ -73,7 +73,8 @@ The shell side has pipes (`|`, and `|&` to include stderr), `&& || ; &`, redirec
 functions; use Python.
 Aliases expand wherever a command starts, including after `;`, `&&`, `||` and `|`; `\ls` skips one. An alias ending in a space also expands the
 word after it: with `alias sudo='sudo '`, `sudo ll` works.
-Builtins: `cd pwd exit export unset alias unalias jobs fg bg wait kill source history type help`.
+Builtins: `cd pwd exit export unset alias unalias jobs fg bg wait kill source history type help activate
+deactivate explain bash_env`.
 
 ### Forcing shell mode with `%`
 
@@ -235,6 +236,10 @@ Without a capture, a pipeline's status is its last stage's, so a failing `git` i
 unnoticed. `last.statuses` lists every stage's status. `set_pipefail = True` (in a script or `~/.pyshrc`) makes any stage's failure count; a command
 cut off because a later stage stopped reading (`yes | head -1`) doesn't. With `-e` that stops the script.
 
+With `quiet_failures = True`, a Python stage that fails only because an earlier command did (say `curl -f`
+leaving `@json.load` with nothing to read) prints one line naming the command instead of a traceback. Errors in
+your own code still show in full. It's off by default and covers the last stage of a pipeline.
+
 ### Python as the source
 
 ```python
@@ -361,6 +366,40 @@ empty, so commands from before this version have no details.
 
 Examples: [`fleet.sh`](examples/fleet.sh), [`logstats.sh`](examples/logstats.sh),
 [`histreport.sh`](examples/histreport.sh), and [`examples/pyshrc`](examples/pyshrc) for hooks and completion.
+
+## How was that line read? `explain`
+
+pysh decides between Python and shell for each line. When the result surprises you, ask:
+
+```
+> explain 'p(repo) | /usr/bin/less'
+read as: shell command
+why:     what follows a `|` is a command Python couldn't use there, so the left side is Python piped into it
+as:      @(p(repo)) | /usr/bin/less
+  1. Python source        @(p(repo))
+     evaluated in a forked copy; what it prints or returns goes into the pipe
+  2. program              /usr/bin/less
+     /usr/bin/less
+status:  that of the last stage (set_pipefail is off)
+```
+
+It covers aliases, `;` `&&` `||` `&`, redirections, captures, `$( )`, globs and which stages run in a forked
+copy. **Nothing is run** and no `@(...)` is evaluated, so quote the line to keep its `|` and `>` from acting.
+
+## Environment from bash scripts: `bash_env`
+
+pysh can't `source` a bash file, but it can run one in bash and take over what it changed:
+
+```
+bash_env /etc/profile
+bash_env ~/.cargo/env
+bash_env -c 'source ~/.nvm/nvm.sh && nvm use 20'
+bash_env -n ./env.sh            # show the changes without applying them (the file still runs)
+```
+
+Set, changed and unset **environment variables** come back; aliases, shell functions, unexported variables and
+`cd` don't. The status is the file's. Put the lines you need in `~/.pyshrc`. `-v` lists what changed (values
+included, so mind secrets).
 
 ## Scripts
 

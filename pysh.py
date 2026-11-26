@@ -414,7 +414,7 @@ def split_heredocs(text):
         bodies.append(("".join(b + "\n" for b in body), quoted))
     return first, bodies, complete
 
-def expand_aliases(toks):
+def expand_aliases(toks, used=None):
     """Replace a string alias wherever a command starts: the beginning of the line and after ; & && || | |&
     (leading `NAME=value` words and redirections don't count). Quoted or escaped names (`\\ls`, `'ls'`) are
     left alone, and an alias is never expanded again inside its own expansion (`alias ls='ls --color'`).
@@ -431,6 +431,7 @@ def expand_aliases(toks):
                 if kind == "lit" and re.match(r"[A-Za-z_]\w*=", text): pass          # VAR=x cmd
                 elif len(t[1]) == 1 and kind == "lit" and text not in inside and isinstance(aliases.get(text), str):
                     value = aliases[text]
+                    if used is not None: used.append(text)
                     more = [(None, inside)] if value.endswith((" ", "\t")) else []
                     queue[:0] = [(x, inside | {text}) for x in tokenize(value)] + more
                     continue
@@ -440,10 +441,10 @@ def expand_aliases(toks):
         if t is not None: out.append(t)
     return out
 
-def parse(line, heredocs=None):
+def parse(line, heredocs=None, used_aliases=None):
     """-> list of (pipeline:list[Stage], terminator: ';' '&&' '||' '&' '')"""
     heredocs = iter(heredocs or [])
-    toks = expand_aliases(tokenize(line))
+    toks = expand_aliases(tokenize(line), used_aliases)
     out, pipe, st, i = [], [], Stage(), 0
     while i < len(toks):
         t = toks[i]
@@ -838,6 +839,9 @@ Python <-> shell:
   cmd | @fn          a Python stage: fn gets a text stream         ... | @json.load
   cmd | x=@fn        keep fn's result in x          x=@ keeps the raw text, x=@tee also shows it
   set_pipefail = True    make a pipeline fail when any stage fails
+  quiet_failures = True  no Python traceback when an earlier command in the pipeline already failed
+  explain 'line'         how a line would be read, without running it
+  bash_env FILE          run FILE in bash and take over its environment changes (-n: only show them)
   from pyshlib import *  extras: @table @freq @stats @where(f) ..., par(), hist, on_cd, completer
   sh(cmd, tee=, check=, timeout=, stream=, capture=)   the same with options
   % cmd      a leading % forces the line to be a shell command (e.g. `% X=1; make`)
@@ -1402,6 +1406,7 @@ class _Node:
         self.__dict__.update(kw)
         self.proc, self.thread, self.status, self.data = None, None, 0, None
         self.assigned_ok = False
+        self.defer, self.error = False, None      # quiet_failures: hold a traceback until we know why
 
 def _env_words(stage, capture_context):
     """split leading NAME=value words off a stage -> (env, remaining words)"""
@@ -1594,8 +1599,10 @@ def _run_function(node, in_fd, out):
             if tb is not None: tb = tb.tb_next
             while tb is not None and tb.tb_next is not None and tb.tb_frame.f_code.co_filename == "<string>" and tb.tb_frame.f_code.co_name == "<module>":
                 tb = tb.tb_next
-        traceback.print_exception(type(e), e, tb)
-        _call_hint(node, e)
+        if node.defer: node.error = (e, tb)
+        else:
+            traceback.print_exception(type(e), e, tb)
+            _call_hint(node, e)
         return 1, None
     finally:
         for k, v in saved.items():
@@ -1694,6 +1701,27 @@ def _tap(node, in_fd, out_fd, show_fd):
                 try: os.close(fd)
                 except OSError: pass
 
+def _outcome(node, allowed):
+    """"ok", "nomatch" (a search that found nothing) or "fail"."""
+    s = node.status
+    if s == 0 or s == 128 + signal.SIGPIPE: return "ok"          # SIGPIPE: a later stage stopped reading
+    if s == 1 and node.kind == "cmd" and os.path.basename(node.argv[0]) in allowed: return "nomatch"
+    return "fail"
+
+def _report_deferred(nodes, target):
+    """With quiet_failures, the last stage's error was held back. Show it only if nothing before it had failed."""
+    final = nodes[-1]
+    if final.error is None: return
+    e, tb = final.error
+    allowed = {os.path.basename(c) for c in ns.get("no_match_commands", ())}
+    cause = next((n for n in nodes[:-1] if _outcome(n, allowed) == "fail"), None)
+    if cause is None:
+        with contextlib.redirect_stderr(target):
+            traceback.print_exception(type(e), e, tb)
+            _call_hint(final, e)
+    elif not final.name:                                   # for name=@..., _judge says it all
+        sh_error(f"{final.label}: no result, because {cause.label} exited with status {cause.status}")
+
 def _judge(nodes):
     """Assign the captured variables that earned it.  -> (status, no_match)."""
     allowed = {os.path.basename(c) for c in ns.get("no_match_commands", ())}
@@ -1708,10 +1736,9 @@ def _judge(nodes):
             elif failed is not None:
                 sh_error(f"{node.name} not assigned: {failed[0]} exited with status {failed[1]}")
             else: sh_error(f"{node.name} not assigned: {node.label} failed")
-        s = node.status
-        if s == 128 + signal.SIGPIPE: continue                      # a later stage stopped reading
-        if s == 1 and node.kind == "cmd" and os.path.basename(node.argv[0]) in allowed: no_match = True; continue
-        if s != 0 and failed is None: failed = (node.label or "a stage", s)
+        outcome = _outcome(node, allowed)
+        if outcome == "nomatch": no_match = True
+        elif outcome == "fail" and failed is None: failed = (node.label or "a stage", node.status)
     last = nodes[-1].status
     if not assigned: return _pipe_status([n.status for n in nodes]), False
     if failed is not None: return failed[1], False
@@ -1836,7 +1863,8 @@ def run_python_pipeline(nodes, capture, capture_err, background, cmdline, tee, s
             if shown_file is not None:
                 shown_file.seek(0); out_buf.write(shown_file.read().decode("utf-8", "replace")); shown_file.close()
 
-        value = None
+        value, sink, errors, err_target = None, None, None, sys.stderr
+        final.defer = bool(ns.get("quiet_failures"))
         if here and final.kind != "tap":
             sink = open(final_out, "w", errors="replace") if final_out is not None else None
             target = sink or out_buf or sys.stdout
@@ -1847,11 +1875,10 @@ def run_python_pipeline(nodes, capture, capture_err, background, cmdline, tee, s
                     try: final.status, value = _run_function(final, final_in, _Out(target, keeps=capture))
                     except BrokenPipeError: final.status = 128 + signal.SIGPIPE
                 target.flush()
-            finally:
+            except BaseException:
                 for f in (sink, errors):
-                    if f is not None:
-                        try: f.close()
-                        except OSError: pass
+                    if f is not None: f.close()
+                raise
             final.value = value
 
         out = err = None
@@ -1866,6 +1893,12 @@ def run_python_pipeline(nodes, capture, capture_err, background, cmdline, tee, s
                     except KeyboardInterrupt: pass
                 node.status = _status(node.proc.returncode)
             if node.thread is not None: node.thread.join()
+        try: _report_deferred(nodes, err_target)
+        finally:
+            for f in (sink, errors):
+                if f is not None:
+                    try: f.close()
+                    except OSError: pass
         status, no_match = _judge(nodes)
         if capture and out_buf is not None and final.kind != "cmd": out = out_buf.getvalue()
         if err_buf is not None and final.kind != "cmd": err = err_buf.getvalue()
@@ -1997,6 +2030,7 @@ ns.update(shell=shell, last=last, __arith__=arith, __env__=_Env(), aliases=alias
           sh=_scoped(sh), ShellError=ShellError, Process=Process)
 ns["__doc__"] = None
 ns["lines"] = lines
+ns["quiet_failures"] = False                     # True: no Python traceback when an earlier command already failed
 ns["set_pipefail"] = False                       # True: a pipeline fails if any stage does, not only the last
 ns["no_match_commands"] = {"grep", "egrep", "fgrep", "zgrep", "rg", "ag", "pgrep"}   # exit 1 means "found nothing"
 ns["import_cwd"] = True                          # `import` finds modules in the current directory (or a script's own directory); False disables
@@ -2090,33 +2124,49 @@ def _python_source(line):
     return f"@({expr}) {rest}"
 
 def classify(line):
+    return _classify(line)[0]
+
+def _classify(line):
+    """-> ("py" or "sh", why). `explain` shows the reason, so it can't drift from what actually happens."""
     s = line.strip()
     m = re.match(r"[^\s|&;<>()=]+", s)
     w = m.group() if m else ""
-    if s.startswith("%"): return "sh"                  # `% cmd`: shell, whatever it looks like
+    if s.startswith("%"): return "sh", "a leading `%` forces shell mode"
     kw = re.match(r"[A-Za-z_]\w*", s)
     if s.startswith("@"):                                          # `@rows | sort` is a pipeline, else a decorator
-        return "sh" if _has_pipe_or_redirect(s) or _splice_with_words(s) else "py"
-    if kw and kw.group() in KW and not (kw.group() in BUILTINS): return "py"
-    if w in BUILTINS and w not in ns and not s[len(w):].lstrip().startswith(("(", "=", ".", "[")): return "sh"
-    if _python_source(s): return "sh"                  # `p(repo) | less`
+        if _has_pipe_or_redirect(s): return "sh", "it starts with `@` and has a `|`, `<` or `>`: a pipeline with Python in it"
+        if _splice_with_words(s): return "sh", "words follow `@(...)`, which a decorator can't have: it splices a command"
+        return "py", "a line starting with `@` and no pipe or redirection is a decorator"
+    if kw and kw.group() in KW and not (kw.group() in BUILTINS): return "py", f"`{kw.group()}` is a Python keyword"
+    if w in BUILTINS and w not in ns and not s[len(w):].lstrip().startswith(("(", "=", ".", "[")):
+        return "sh", f"`{w}` is a shell builtin (and not a Python variable)"
+    if _python_source(s):
+        return "sh", "what follows a `|` is a command Python couldn't use there, so the left side is Python piped into it"
     try: py = preprocess(s)
-    except SyntaxError: return "sh"                    # e.g. an unbalanced $( : the shell parser reports it
+    except SyntaxError: return "sh", "it has an unbalanced `$(` or `!(`; the shell parser will report it"
     try: code = codeop.compile_command(py, "<pysh>", "single")
-    except (SyntaxError, ValueError, OverflowError): return "sh"
+    except (SyntaxError, ValueError, OverflowError): return "sh", "it is not valid Python"
     if code is None:                                  # unfinished: an open bracket/string, or a block header
-        if (w in ns or hasattr(builtins, w)) and s[len(w):].startswith("("): return "py"     # `print(` carrying on, whatever
-        return "sh" if (w and w not in ns and is_command(w)) else "py"                        # programs are on $PATH
+        if (w in ns or hasattr(builtins, w)) and s[len(w):].startswith("("): return "py", f"a call to `{w}` that continues on the next line"
+        if w and w not in ns and is_command(w): return "sh", f"unfinished as Python, and `{w}` is a command"
+        return "py", "an unfinished Python statement"
     try: tree = ast.parse(py)
-    except SyntaxError: return "sh"
+    except SyntaxError: return "sh", "it is not valid Python"
     if tree.body and all(isinstance(x, ast.Expr) for x in tree.body) and w:
         unbound = [n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
                    and n.id not in ns and not hasattr(builtins, n.id)]
         looks_call = s[len(w):].lstrip().startswith("(")
-        if (w in unbound or (unbound and w in ns is False)) and is_command(w) and not looks_call: return "sh"
-        if unbound and not looks_call and is_command(w) and w not in ns: return "sh"
-        if unbound and hasattr(builtins, w) and w not in ns and not looks_call and on_path(w): return "sh"
-    return "py"
+        missing = ", ".join(f"`{n}`" for n in dict.fromkeys(unbound))
+        if unbound and not looks_call and is_command(w) and w not in ns:
+            return "sh", f"valid Python, but {missing} is not defined and `{w}` is a command"
+        if unbound and hasattr(builtins, w) and w not in ns and not looks_call and on_path(w):
+            return "sh", f"`{w}` is both a Python built-in and a program, and {missing} is not defined, so it's the program"
+        if unbound:
+            verb = "are" if "," in missing else "is"
+            instead = "it starts like a call" if looks_call else f"`{w}` is not a command either"
+            return "py", f"valid Python, and {instead}; {missing} {verb} not defined, so it would raise NameError"
+        return "py", "valid Python, and every name in it is defined"
+    return "py", "it is a Python statement"
 
 def run_python(src):
     global last
@@ -2136,6 +2186,182 @@ def run_python(src):
         _setlast(Result(1, cmd=src))
         return
     _setlast(Result(0, cmd=src))
+
+# --------------------------------------------------------------- explain
+def _render(word):
+    """a parsed word, written back roughly as typed"""
+    out = []
+    for kind, text in word:
+        out.append({"sq": f"'{text}'", "dq": '"' + text.replace("\x00", "\\") + '"', "var": f"${text}", "sub": f"$({text})",
+                    "arith": f"$(({text}))", "py": f"@({text})", "call": f"@{text}"}.get(kind, text))
+    return "".join(out)
+
+def _explain_command(words, used):
+    name_word = words[0]
+    if any(kind in ("var", "sub", "py", "arith") for kind, _ in name_word): return "program", "chosen when the line runs"
+    name = "".join(text for _, text in name_word)
+    if name in BUILTINS: return "builtin", "runs inside the shell"
+    if callable(aliases.get(name)): return "function alias", "a Python function"
+    if "/" in name:
+        full = os.path.expanduser(name)
+        return "program", full if os.access(full, os.X_OK) and not os.path.isdir(full) else "not found or not executable"
+    found = shutil.which(name)
+    return ("program", found) if found else ("program", "NOT FOUND: this would give `command not found`")
+
+def _explain_stage(st, i, count):
+    """-> (kind, detail, text). Looks only: nothing is run, and no `@(...)` is evaluated."""
+    last, ctx = i == count - 1, i > 0 or _has_input(st)
+    words, env = list(st.words), []
+    while words and words[0] and words[0][0][0] == "lit" and _ENV_WORD.match(words[0][0][1]) and not (ctx and _is_capture_word(words[0])):
+        env.append(_render(words.pop(0)))
+    text = " ".join(_render(w) for w in words) or " ".join(env)
+    if not words: return "assignment", "sets environment variables", text
+    w, where = words[0], "in the shell" if last else "in a forked copy of the shell (its variable changes are lost)"
+    kind, value = w[0]
+    if ctx and _is_capture_word(w):
+        spec = value.split("=@", 1)[1] if len(w) == 1 else None
+        name = value.split("=")[0]
+        if spec in ("", "tee"): result = "capture", f"keeps the raw text in `{name}`" + (" and shows it" if spec else "")
+        else: result = "Python, then assign", f"calls the function on the stream and puts the result in `{name}`; runs in the shell"
+    elif len(w) == 1 and kind == "lit" and value == "@tee":
+        result = "tee", "shows the data and passes it on"
+    elif len(w) == 1 and kind == "lit" and _AT_NAME.match(value):
+        try: obj, found = _dotted(value[1:]), True
+        except Exception: obj, found = None, False
+        source = i == 0 and not _has_input(st)
+        if not found: result = "Python", f"`{value[1:]}` is NOT DEFINED: the pipeline would not start"
+        elif callable(obj): result = ("Python source", f"calls it with no stream; runs {where}") if source else ("Python function", f"gets the stream; runs {where}")
+        elif source: result = "Python source", "writes the value into the pipe"
+        else: result = "Python", f"`{value[1:]}` is not callable: this is an error"
+    elif len(w) == 1 and kind in ("py", "call"):
+        if i == 0 and len(words) == 1 and not _has_input(st) and (count > 1 or _has_output(st)):
+            result = "Python source", "evaluated in a forked copy; what it prints or returns goes into the pipe"
+        elif kind == "call": result = "Python", f"calls it, and the function it returns gets the stream; runs {where}"
+        else: result = "@( )", "a Python stage if the value is callable, otherwise spliced in as words (not evaluated here)"
+    else:
+        result = _explain_command(words, env)
+    detail = result[1]
+    if env: detail += f"; with {' '.join(env)}"
+    for fd, mode, target in st.redirs:
+        if mode == "dup": detail += f"; fd {fd} goes where fd {target} goes"
+        elif mode == "heredoc": detail += "; reads a here-document"
+        else: detail += f"; {'' if fd in (0, 1) else str(fd)}{'<<<' if mode == 'herestr' else mode} {_render(target)}"
+    return result[0], detail, text
+
+def explain_line(line):
+    """What pysh would do with `line`, as text. Nothing is executed."""
+    first, _, more = line.partition("\n")
+    kind, why = _classify(first)
+    out = [f"read as: {'Python' if kind == 'py' else 'shell command'}", f"why:     {why}"]
+    if more: out.append("note:    only the first line is explained")
+    if kind == "py":
+        m = re.match(r"\s*([A-Za-z_][\w.+-]*)", first)
+        if m and m.group(1) in ns: out.append(f"names:   `{m.group(1)}` is a Python object ({type(ns[m.group(1)]).__name__})")
+        if m and shutil.which(m.group(1)): out.append(f"hint:    `{m.group(1)}` is also a program; `% {first.strip()}` runs it instead")
+        return "\n".join(out)
+    text = first.strip()
+    forced = text.startswith("%")
+    if forced: text = text[1:].strip()
+    rewritten = None if forced else _python_source(text)
+    if rewritten: out.append(f"as:      {rewritten}"); text = rewritten
+    body, heredocs = text, []
+    try:
+        body = split_heredocs(text)[0]
+        used = []
+        items = parse(body, [("", False)] * len(heredoc_markers(body)), used)
+    except (SyntaxError, ArithmeticError) as e:
+        return "\n".join(out + [f"error:   syntax error: {e}"])
+    for name in dict.fromkeys(used): out.append(f"alias:   {name} -> {aliases[name]}")
+    joined = {"&&": "then, only if that succeeded:", "||": "then, only if that failed:", ";": "then:", "&": "(in the background) then:"}
+    previous = ""
+    for pipe, term in items:
+        if previous: out.append(joined.get(previous, previous))
+        for i, st in enumerate(pipe):
+            what, detail, shown = _explain_stage(st, i, len(pipe))
+            out.append(f"  {i + 1}. {what:<20} {clean(shown)}")
+            out.append(f"     {clean(detail)}")
+        previous = term
+    if previous == "&": out.append("runs in the background")
+    if any(kind in ("sub",) for pipe, _ in items for st in pipe for w in st.words for kind, _ in w) or "$(" in body:
+        out.append("first:   each $( ) is run before its command, and replaced by its output")
+    if any(kind == "lit" and re.search(r"[*?\[]", v) for pipe, _ in items for st in pipe for w in st.words[1:] for kind, v in w):
+        out.append("globs:   unquoted * ? [ ] become the matching file names")
+    if any(len(pipe) > 1 for pipe, _ in items):
+        out.append(f"status:  {'any failing stage (set_pipefail is on)' if ns.get('set_pipefail') else 'that of the last stage (set_pipefail is off)'}")
+    return "\n".join(out)
+
+def b_explain(a):
+    if not a: sh_error("usage: explain 'LINE'   (quote it, so that its | and > are not run)"); return 2
+    print(explain_line(" ".join(a)))
+    return 0
+
+# --------------------------------------------------------------- bash_env
+_BASH_OWN = {"_", "SHLVL", "PWD", "OLDPWD", "PS1", "PS2", "PS4", "PIPESTATUS", "BASH_ENV", "PYSH_BASH_ENV_OUT"}
+_IDENT = re.compile(r"[A-Za-z_]\w*\Z")
+
+def _describe_change(name, old, new):
+    """`NAME=value`; for a list like PATH that already existed, just what was added and removed."""
+    if old and name.endswith(("PATH", "DIRS")):
+        before, after = old.split(os.pathsep), new.split(os.pathsep)
+        added = [p for p in after if p not in before]
+        gone = [p for p in before if p not in after]
+        parts = ([f"adds {os.pathsep.join(added)}"] if added else []) + ([f"removes {os.pathsep.join(gone)}"] if gone else [])
+        return f"{name}: " + ("; ".join(parts) if parts else "same entries, new order")
+    return f"{name}={new}"
+
+def b_bash_env(a):
+    """bash_env [-n] [-v] FILE [ARG...] | -c 'COMMAND': run it in bash, then take over its environment changes."""
+    dry = verbose = False
+    command = None
+    while a and a[0].startswith("-") and a[0] != "-":
+        flag, a = a[0], a[1:]
+        if flag == "--": break
+        if flag == "-n": dry = verbose = True
+        elif flag == "-v": verbose = True
+        elif flag == "-c" and a: command, a = a[0], a[1:]; break
+        else: command, a = None, []; break
+    if command is None and not a:
+        sh_error("usage: bash_env [-n] [-v] FILE [ARG...]   or   bash_env [-n] [-v] -c 'COMMANDS'"); return 2
+    bash = shutil.which("bash")
+    if not bash: sh_error("bash_env: bash is not installed"); return 127
+    if command is None:
+        path = os.path.expanduser(a[0])
+        if not os.path.isfile(path): sh_error(f"bash_env: {a[0]}: no such file"); return 1
+        if "/" not in path: path = "./" + path                     # `source name` would search $PATH
+        script, args = 'source "$0" "$@"', [path, *a[1:]]
+    else:
+        script, args = command, ["bash_env", *a]
+    fd, out = tempfile.mkstemp(prefix="pysh-env-"); os.close(fd)
+    try:
+        child = {k: v for k, v in os.environ.items() if k != "BASH_ENV"}
+        child["PYSH_BASH_ENV_OUT"] = out
+        sys.stdout.flush()
+        # the trap also records the environment if the file calls `exit` or fails under `set -e`
+        proc = subprocess.run([bash, "--noprofile", "--norc", "-c",
+                               "trap 'command env -0 > \"$PYSH_BASH_ENV_OUT\"' EXIT\n" + script, *args], env=child)
+        with open(out, "rb") as f: dump = f.read()
+    finally:
+        try: os.unlink(out)
+        except OSError: pass
+    if not dump:
+        sh_error("bash_env: bash did not report an environment (killed, or it replaced itself); nothing changed")
+        return _status(proc.returncode) or 1
+    after = dict(item.split("=", 1) for item in os.fsdecode(dump).split("\0") if "=" in item)
+    def ours(name): return name not in _BASH_OWN and not name.startswith(("BASH_FUNC_", "BASH_"))
+    changed = {k: v for k, v in after.items() if ours(k) and os.environ.get(k) != v}
+    # names bash can't hold as variables (WSL has some) are never reported as removed
+    removed = [k for k in os.environ if ours(k) and _IDENT.match(k) and k not in after]
+    if verbose:
+        for k in sorted(changed): print(f"{'would set' if dry else 'set'} {clean(_describe_change(k, os.environ.get(k), changed[k]))}")
+        for k in sorted(removed): print(f"{'would unset' if dry else 'unset'} {clean(k)}")
+        if not changed and not removed: print("no environment changes")
+    if not dry:
+        os.environ.update(changed)
+        for k in removed: os.environ.pop(k, None)
+        _cmdcache.clear(); command_index.refresh()
+    return _status(proc.returncode)
+
+BUILTINS.update(explain=b_explain, bash_env=b_bash_env)
 
 def run_line(line):
     """Run one logical (possibly multi-physical-line) entry."""
@@ -2359,6 +2585,7 @@ BUILTIN_DOC = {"cd": "change directory", "exit": "leave the shell", "quit": "lea
                "alias": "define or list aliases", "unalias": "remove aliases", "jobs": "list background jobs",
                "source": "run a script in this shell", ".": "run a script in this shell",
                "activate": "use a virtualenv", "deactivate": "leave the virtualenv",
+               "explain": "show how a line would be read", "bash_env": "take environment changes from a bash script",
                "history": "show command history", "pwd": "print the working directory", "fg": "resume a job in the foreground", "bg": "resume a job in the background",
                "wait": "wait for background jobs", "kill": "signal a process or %job", "type": "describe how a name resolves", "help": "pysh help"}
 
@@ -2645,6 +2872,7 @@ del _ls
 # complete_ignore = (".dll", ".exe", ".vbs", ".efi", ".mof", ".bat", ".drv", ".sys", ".tlb", ".xml")
 # complete_ignore_dirs = ("/mnt/c",)  # PATH directories left out of command completion
 # set_pipefail = False                # True: a pipeline fails if any of its stages does
+# quiet_failures = False              # True: no Python traceback when an earlier command already failed
 # no_match_commands |= {"mytool"}     # more commands whose exit status 1 means "found nothing" (for | x=@...)
 
 # The prompt. Fields: {venv} {user} {host} {cwd} {branch} {status}
@@ -2653,6 +2881,7 @@ PS1 = "@PS1@"
 
 # Examples
 # export EDITOR=nano                       # Alt-E opens $EDITOR (default vim)
+# bash_env /etc/profile                    # take over what a bash script sets (nvm, cargo, conda, ...)
 # from pyshlib import table, where, freq   # extras; or: from pyshlib import *   (see `man pysh`)
 # export PATH=~/bin:$PATH
 # alias ll='ls -l'

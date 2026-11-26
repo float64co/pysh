@@ -471,6 +471,12 @@ still raises.
 A wrapper such as
 .B sudo grep
 hides the command, so the variable is left unchanged.
+.PP
+With
+.BR "quiet_failures = True" ,
+when the last stage of a pipeline fails after an earlier command already had, one line naming that command
+replaces the Python traceback.
+It is off by default.
 .SS Pipeline status
 .B last.statuses
 lists the exit status of every stage.
@@ -782,7 +788,34 @@ as input and their own process group.
 .BR bg ,
 .BR wait ,
 .BR kill ,
-.BR help .
+.BR help ,
+.BR activate ,
+.BR deactivate ,
+.BR explain ,
+.BR bash_env .
+.TP
+.BI "explain \(aq" line \(aq
+Show how
+.I line
+would be read: Python or shell and why, each stage of each pipeline, aliases, redirections, and what runs in a
+forked copy.
+Nothing is run and no
+.B @( )
+is evaluated.
+Quote the line so that its operators do not act.
+.TP
+.BR "bash_env " [ \-n "] [" \-v "] \fIfile\fP [\fIarg\fP...] | " "\-c \fIcommands\fP"
+Run the file or commands in bash and take over the environment variables they set, change or unset.
+Aliases, functions, unexported variables and
+.B cd
+are not carried over.
+The status is bash\(aqs.
+.B \-v
+lists the changes;
+.B \-n
+lists them without applying them (the file is still run).
+.B BASH_ENV
+is not honoured.
 .SH LINE EDITING
 .TP
 .B Autosuggestion
@@ -982,6 +1015,13 @@ Set to
 in
 .I ~/.pyshrc
 to disable it for interactive sessions.
+.TP
+.B quiet_failures
+When
+.B True
+(default
+.BR False ),
+no traceback for a Python stage whose pipeline had already failed.
 .TP
 .B set_pipefail
 When

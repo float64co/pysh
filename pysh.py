@@ -1,7 +1,7 @@
 # pysh -- embedded shell logic.  Executed by pysh.c inside __main__.
 import ast, builtins, codeop, collections, collections.abc, contextlib, glob, importlib, importlib.abc, importlib.util, json, inspect, io, keyword, operator, os, re, shlex, shutil, signal, site, subprocess, sys, tempfile, threading, time, traceback, types, warnings
 
-VERSION = "0.1"
+VERSION = "0.0.3"
 shell = sys.modules["__main__"]                # pysh's own internals: shell.jobs, shell.history, ...
 ns = {"__name__": "__main__", "__builtins__": builtins}   # the namespace your Python lines run in
 aliases = {}                                   # name -> str | callable(args)->str|int|None

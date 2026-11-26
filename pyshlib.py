@@ -221,15 +221,32 @@ def _template(command):
             raise ValueError("par: write {} without quotes (each item is already passed as one argument)")
     return text
 
+class _Results(list):
+    """what par() with a command returns: a list of Results, which also knows how to end a pipeline stage"""
+    def _as_stage(self, out):
+        """write the output, pass error messages on, and -> the stage's status: 1 if any item failed"""
+        for r in self:
+            if r.out:
+                out.write(r.out if r.out.endswith("\n") else r.out + "\n")
+            out.flush()                                    # keep each item's output ahead of its errors
+            if r.err: sys.stderr.write(r.err if r.err.endswith("\n") else r.err + "\n")
+            if r.returncode and (r.timed_out or not r.err):          # nothing else would say what went wrong
+                why = "timed out" if r.timed_out else f"exit status {r.returncode}"
+                print(f"par: {_clean(r.item)}: {why}", file=sys.stderr)
+        return 1 if any(r.returncode for r in self) else 0
+
 def par(items, command, jobs=8, timeout=None):
     """Run a command (or a function) for every item, `jobs` at a time. -> the results in the items' order.
 
         for r in par(hosts, "ssh {} uptime"): print(r.item, r.returncode, r.out)
         par(files, os.path.getsize)
+        cat hosts.txt | @par 'ssh {} uptime'          (the items are the lines, without their newlines)
+
+    As a stage it prints each command's output and errors, and fails if any item did (after trying them all).
 
     In a command, {} is the item as ONE argument, so spaces or `;` in it do nothing. Don't quote it. An item
     starting with `-` is still read as an option by many programs: put `--` before {} if that matters."""
-    items = list(items)
+    items = list(_lines(items) if hasattr(items, "read") else items)       # a stream: a pipeline stage, or a file
     if int(jobs) < 1: raise ValueError("par: jobs must be at least 1")
     if callable(command): run = command
     else:
@@ -245,7 +262,8 @@ def par(items, command, jobs=8, timeout=None):
     errexit, _shell._errexit = _shell._errexit, False             # a failing item is a result, not the end of the script
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=int(jobs))
     try:
-        return list(pool.map(run, items))
+        results = pool.map(run, items)
+        return list(results) if callable(command) else _Results(results)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
         _shell._errexit = errexit

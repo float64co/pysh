@@ -335,12 +335,17 @@ numbers the columns.
 for r in par(["web1", "web2"], "ssh {} uptime", jobs=8):
     print(r.item, r.returncode, r.out.strip())
 sizes = par(files, os.path.getsize)         # or a function
+cat hosts.txt | @par 'ssh {} uptime'        # in a pipeline, each line is an item
 ```
+
+As a pipeline stage, `par` prints each command's output, in the items' order, and its error messages on
+standard error. Every item is tried; the stage then fails if any did, so a `-e` script stops there. With
+`r=@par ...` nothing is printed and the assignment succeeds: check `r` yourself.
 
 Results come back in the items' order. In a command, `{}` is the item passed as **one argument**, so `;`,
 `$(...)` or spaces in a filename or hostname do nothing. A quoted `"{}"` is refused. An item starting with `-`
-may still be read as an option; write `-- {}` if that matters. `timeout=` gives status 124, and a failing item
-doesn't stop a `-e` script.
+may still be read as an option; write `-- {}` if that matters. `timeout=` gives status 124. When you call
+`par(...)` directly, a failing item doesn't stop a `-e` script.
 
 ### History, temporary changes, hooks, completion
 

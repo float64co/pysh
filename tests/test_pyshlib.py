@@ -184,6 +184,36 @@ class Par(Case):
             print(par("abc", str.upper))
             """, "0.3 0.3 0\n0.1 0.1 0\n0.2 0.2 0\n['A', 'B', 'C']\n")
 
+    def test_as_a_pipeline_stage_each_line_is_an_item_without_its_newline(self):
+        self.check("""
+            printf 'a b\\nc\\n' | @par 'printf [%s] {}'
+            printf 'a\\nb' | r=@par 'echo {}'
+            print([x.item for x in r])
+            with open("items", "w") as f: f.write("x\\ny\\n")
+            with open("items") as f: print([x.item for x in par(f, "true {}")])
+            """, "[a b]\n[c]\n['a', 'b']\n['x', 'y']\n")
+
+    def test_a_stage_shows_errors_and_fails_after_trying_every_item(self):
+        r = self.sh("""
+            both = "sh -c 'echo out$0; echo err$0 >&2; exit $0' {}"
+            status = "sh -c 'exit $0' {}"
+            printf '1\\n0\\n' | @par @(both) 1
+            print(last.returncode)
+            printf '3\\n' | @par @(status)
+            printf 'a\\n' | @par 'true {}'
+            print(last.returncode)
+            printf '1\\n' | r=@par 'false {}'
+            print(last.returncode, r[0].returncode)
+            print(len(par(['a'], "false {}")))
+            """)
+        self.assertEqual(r.stdout, "out1\nout0\n1\n0\n0 1\n1\n", r.stderr)
+        self.assertEqual(r.stderr, "err1\nerr0\npar: 3: exit status 3\n")
+
+    def test_a_failed_stage_stops_an_errexit_script(self):
+        r = self.sh("""both = "sh -c 'echo $0; exit $0' {}"\nprintf '1\\n0\\n' | @par @(both)\necho NOT\n""", "-e")
+        self.assertEqual(r.stdout, "1\n0\n", r.stderr)
+        self.assertNotEqual(r.returncode, 0)
+
     def test_runs_in_parallel(self):
         t = time.time()
         self.sh("""par(range(6), "sh -c 'sleep 1' {}", jobs=6)\n""")

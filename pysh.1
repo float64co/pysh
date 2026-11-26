@@ -645,6 +645,14 @@ runs a command, or calls a function, for every item and returns the results in o
 .B Result
 has
 .BR .item .
+As a pipeline stage,
+.BR "cat hosts.txt | @par \(aqssh {} uptime\(aq" ,
+each input line, without its newline, is an item; an open file works the same way.
+The stage writes each command's output in the items' order and passes its error messages to standard error.
+Every item is tried, and the stage then fails if any item did.
+With
+.B r=@par
+nothing is written and the results are assigned even if some failed.
 In a command
 .B {}
 is the item passed as one argument, so its contents are never read as shell syntax; it must not be quoted.
@@ -652,7 +660,9 @@ An item beginning with
 .B \-
 may still be taken as an option.
 A timeout gives status 124.
-Failing items do not stop a
+When
+.B par()
+is called directly, failing items do not stop a
 .B \-e
 script.
 .SS History, temporary changes and hooks

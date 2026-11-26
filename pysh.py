@@ -1590,6 +1590,8 @@ def _run_function(node, in_fd, out):
             if node.name:
                 if isinstance(value, collections.abc.Iterator): value = list(value)    # while the input is still open
                 return 0, value
+            ending = getattr(type(value), "_as_stage", None)     # a function's result that has its own output and status
+            if ending and node.kind == "call": return ending(value, out), value
             return 0, _write_result(value, out)
     except (SystemExit, KeyboardInterrupt): raise
     except BrokenPipeError: raise

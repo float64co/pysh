@@ -1,5 +1,5 @@
 # pysh -- embedded shell logic.  Executed by pysh.c inside __main__.
-import ast, builtins, codeop, collections, collections.abc, contextlib, glob, importlib, inspect, io, keyword, operator, os, re, shlex, shutil, signal, site, subprocess, sys, tempfile, threading, time, traceback, types, warnings
+import ast, builtins, codeop, collections, collections.abc, contextlib, glob, importlib, importlib.abc, importlib.util, json, inspect, io, keyword, operator, os, re, shlex, shutil, signal, site, subprocess, sys, tempfile, threading, time, traceback, types, warnings
 
 VERSION = "0.1"
 shell = sys.modules["__main__"]                # pysh's own internals: shell.jobs, shell.history, ...
@@ -16,6 +16,11 @@ class Result:
         self.timed_out = False
         self.value = None            # what a final Python stage returned
         self.no_match = False        # status 1 only because a search found nothing: -e carries on
+        self._statuses = None
+    @property
+    def statuses(self):
+        """the exit status of every stage of the pipeline"""
+        return list(self._statuses) if self._statuses is not None else [self.returncode]
     def __bool__(self): return self.returncode == 0
     def __str__(self): return self.out or ""
     def __repr__(self):
@@ -28,6 +33,21 @@ def _setlast(r):
     global last
     last = r; ns["last"] = r
     return r
+
+# --------------------------------------------------------------- pyshlib
+cd_hooks = []        # functions run after `cd` (pyshlib.on_cd)
+completers = {}      # command -> function(word, args) (pyshlib.completer)
+
+class _PyshlibImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """`import pyshlib`: the copy built into the binary. It comes first on the meta path, so a pyshlib.py
+    lying in the current directory is never picked up instead."""
+    def find_spec(self, name, path=None, target=None):
+        return importlib.util.spec_from_loader(name, self) if name == "pyshlib" else None
+    def exec_module(self, module):
+        module.__dict__["_shell"] = shell
+        exec(compile(globals()["__pyshlib__"], "<pyshlib>", "exec"), module.__dict__)
+
+sys.meta_path.insert(0, _PyshlibImporter())
 
 # --------------------------------------------------------------- tokenizer
 def match_paren(s, i):
@@ -64,6 +84,18 @@ def match_bracket(s, i):
     raise SyntaxError("unbalanced [ in command")
 
 VARRE = re.compile(r"\$(?:\{(\w+)\}|(\w+|\?|\$))")
+
+_AT_CALL = re.compile(r"@[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\(")
+
+def _is_name_equals(segs):
+    """the word so far is exactly `name=`, so `name=@fn(...)` follows"""
+    return len(segs) == 1 and segs[0][0] == "lit" and re.fullmatch(r"[A-Za-z_]\w*=", segs[0][1]) is not None
+
+def _closing(s, i):
+    """index just past the bracket matching s[i], if what follows can end a word; else None"""
+    try: j = match_paren(s, i)
+    except SyntaxError: return None
+    return j if s[j:j+1] in ("", " ", "\t", "\n", "|", "&", ";", "<", ">") else None
 
 def tokenize(s):
     toks, i, n, cur = [], 0, len(s), None
@@ -121,6 +153,8 @@ def tokenize(s):
             if c == "$" and is_arith(inner): add("arith", inner[1:-1])
             else: add("sub" if c == "$" else "py", inner)
             i = j
+        elif c == "@" and (cur is None or _is_name_equals(cur)) and (m := _AT_CALL.match(s, i)) and (j := _closing(s, m.end() - 1)):
+            add("call", s[i+1:j]); i = j                    # `@where(...)`: one word, spaces and all
         elif c == "$":
             m = VARRE.match(s, i)
             if m: add("var", m.group(1) or m.group(2)); i = m.end()
@@ -306,6 +340,7 @@ def _expand_word(segs, assign=False):
             if assign: text = re.sub(r"(?<=[=:])~[^/:=]*", lambda m: os.path.expanduser(m.group()), text)
             put(text, False)
         elif kind == "sq": put(text, True)
+        elif kind == "call": put("@" + text, True)          # not in a command position: just the text
         elif kind == "dq":
             put("", True)
             for k, t in expand_dq(text):
@@ -440,11 +475,99 @@ def parse(line, heredocs=None):
     return out
 
 # --------------------------------------------------------------- execution
+class _CommandIndex:
+    """Which names are on $PATH, kept in memory, so judging a half-typed line doesn't search every directory
+    on each keystroke (one search costs ~50 ms when $PATH has Windows directories under WSL).
+
+    Interactive shells only. A background thread lists the directories at startup. Before each prompt, a
+    directory that is quick to `stat` is re-listed if it changed; a slow one is re-listed in the background
+    once a minute. The index can be out of date, so it only ever *speeds up* an answer: a hit is checked on
+    disk, and when a line is run, a miss is confirmed with a real search."""
+    SLOW_STAT = 0.0005              # seconds; a directory slower than this to stat is refreshed in the background
+    SLOW_AGE = 60.0                 # how stale a slow directory's listing may get
+
+    def __init__(self):
+        self.dirs = {}              # directory -> (names, mtime_ns, slow, listed_at)
+        self.started = False
+        self._pending = set()
+
+    @staticmethod
+    def path():
+        return list(dict.fromkeys(os.environ.get("PATH", os.defpath).split(os.pathsep)))
+
+    def _stat(self, d):
+        t = time.perf_counter()
+        try: mtime = os.stat(d).st_mtime_ns
+        except OSError: mtime = None
+        return mtime, time.perf_counter() - t > self.SLOW_STAT
+
+    def _scan(self, d, known=None):
+        mtime, slow = known or self._stat(d)
+        try: names = frozenset(os.listdir(d)) if mtime is not None else frozenset()
+        except OSError: names = frozenset()
+        self.dirs[d] = (names, mtime, slow, time.monotonic())
+
+    def _background(self, directories):
+        todo = [d for d in directories if d not in self._pending]
+        if not todo: return
+        self._pending.update(todo)
+        def work():
+            for d in todo:
+                try: self._scan(d)
+                finally: self._pending.discard(d)
+        threading.Thread(target=work, daemon=True, name="pysh-path-index").start()
+
+    def start(self):
+        self.started = True
+        self._background([d for d in self.path() if os.path.isabs(d)])
+
+    def refresh(self):
+        """called before each prompt; must stay quick"""
+        if not self.started: return
+        later, now = [], time.monotonic()
+        for d in self.path():
+            if not os.path.isabs(d): continue
+            entry = self.dirs.get(d)
+            if entry is None:                              # new on $PATH: list it now if it is quick
+                known = self._stat(d)
+                if known[1]: later.append(d)
+                else: self._scan(d, known)
+            elif entry[2]:                                 # slow: never make the prompt wait for it
+                if now - entry[3] > self.SLOW_AGE: later.append(d)
+            else:
+                mtime, slow = self._stat(d)
+                if mtime != entry[1]: self._scan(d, (mtime, slow))
+        self._background(later)
+
+    def lookup(self, name):
+        """is there an executable `name` in a $PATH directory, as far as the index knows?"""
+        for d in self.path():
+            entry = self.dirs.get(d)
+            if os.path.isabs(d) and (entry is None or name not in entry[0]): continue
+            full = os.path.join(d or ".", name)                    # relative entries depend on the cwd: look directly
+            if os.access(full, os.X_OK) and not os.path.isdir(full): return True
+        return False
+
+    def names(self, d):
+        """the listing of `d` if the index has one, else None"""
+        entry = self.dirs.get(d) if self.started else None
+        return None if entry is None else entry[0]
+
+command_index = _CommandIndex()
+_typing = False             # the line editor is asking: answer from the index alone
+
+def on_path(w):
+    if not command_index.started or "/" in w or not w: return shutil.which(w) is not None
+    if command_index.lookup(w): return True
+    return False if _typing else shutil.which(w) is not None       # about to be run: make sure before saying no
+
 _cmdcache = {}          # name -> bool; cleared before every prompt so new installs are noticed
 def is_command(w):
     if w in BUILTINS or w in aliases: return True
     r = _cmdcache.get(w)
-    if r is None: r = _cmdcache[w] = shutil.which(w) is not None
+    if r is None:
+        r = on_path(w)
+        if r or not _typing: _cmdcache[w] = r           # a "no" from the index alone is not remembered
     return r
 
 # ------------------------------------------------------------------ trust helpers
@@ -520,7 +643,23 @@ def b_cd(a):
     os.environ["OLDPWD"] = old
     new = os.getcwd()
     os.environ["PWD"] = target if (not physical and os.path.isabs(target) and _same_dir(target, new)) else new
+    run_cd_hooks()
     return 0
+_in_cd_hook = False
+
+def run_cd_hooks():
+    global _in_cd_hook
+    if _in_cd_hook or not cd_hooks: return                  # a hook that cds doesn't start them again
+    _in_cd_hook, before = True, last
+    try:
+        for hook in list(cd_hooks):
+            try: hook(logical_cwd())
+            except SystemExit: raise
+            except Exception as e: sh_error(f"on_cd {getattr(hook, '__name__', hook)}: {type(e).__name__}: {e}")
+    finally:
+        _in_cd_hook = False
+        _setlast(before)
+
 def b_pwd(a):
     print(os.getcwd() if a and a[0] == "-P" else logical_cwd())
     return 0
@@ -699,6 +838,7 @@ Python <-> shell:
   cmd | @fn          a Python stage: fn gets a text stream         ... | @json.load
   cmd | x=@fn        keep fn's result in x          x=@ keeps the raw text, x=@tee also shows it
   set_pipefail = True    make a pipeline fail when any stage fails
+  from pyshlib import *  extras: @table @freq @stats @where(f) ..., par(), hist, on_cd, completer
   sh(cmd, tee=, check=, timeout=, stream=, capture=)   the same with options
   % cmd      a leading % forces the line to be a shell command (e.g. `% X=1; make`)
   last       the Result of the previous command
@@ -1195,9 +1335,12 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
             if INTERACTIVE: print(f"[{job.id}] {job.pids[-1]}")
             return Result(0, None, None, 0, cmdline)
         rc = run_foreground(job)
+        codes = None
         if job.state == "done":
-            rc = _pipe_status([own_rc[n] if p is None else job.codes.get(p.pid, 0) for n, p in enumerate(procs)])
+            codes = [own_rc.get(n, 0) if p is None else job.codes.get(p.pid, 0) for n, p in enumerate(procs)]
+            rc = _pipe_status(codes)
         res = Result(rc, tail_out, None, time.time() - t0, cmdline)
+        res._statuses = codes
         if killer: killer.cancel(); res.timed_out = killer.fired
         return res
     if background: return Result(0, None, None, 0, cmdline)
@@ -1212,9 +1355,11 @@ def run_pipeline(pipe, capture=False, capture_err=False, background=False, cmdli
                 else: p.wait()
                 break
             except KeyboardInterrupt: pass
-    if procs: rc = _pipe_status([own_rc.get(n, 0) if p is None else _status(p.returncode) for n, p in enumerate(procs)])
+    codes = [own_rc.get(n, 0) if p is None else _status(p.returncode) for n, p in enumerate(procs)]
+    if procs: rc = _pipe_status(codes)
     if tail_out is not None: out = tail_out
     res = Result(rc, out, err, time.time() - t0, cmdline)
+    res._statuses = codes or None
     if killer: killer.cancel(); res.timed_out = killer.fired
     return res
 
@@ -1273,7 +1418,7 @@ def _is_capture_word(w):
     """an unquoted `name=@`, `name=@dotted` or `name=@(expr)`"""
     if w[0][0] != "lit": return False
     if len(w) == 1: return bool(_CAPTURE.match(w[0][1]))
-    return len(w) == 2 and w[1][0] == "py" and re.fullmatch(r"[A-Za-z_]\w*=", w[0][1]) is not None
+    return len(w) == 2 and w[1][0] in ("py", "call") and re.fullmatch(r"[A-Za-z_]\w*=", w[0][1]) is not None
 
 def _has_input(stage): return any(fd == 0 and mode in ("<", "heredoc", "herestr") for fd, mode, _ in stage.redirs)
 def _has_output(stage): return any(mode in (">", ">>") and fd in (1, "both") for fd, mode, _ in stage.redirs)
@@ -1314,7 +1459,7 @@ def plan_stages(pipe):
         if len(w) != 1: return False
         kind, text = w[0]
         if kind == "lit": return bool(_AT_NAME.match(text))
-        return kind == "py" and (len(pipe) > 1 or bool(st.redirs))
+        return kind in ("py", "call") and (len(pipe) > 1 or bool(st.redirs))
     if not any(interesting(st, i) for i, st in enumerate(pipe)): return None
 
     nodes, special = [], False
@@ -1335,7 +1480,7 @@ def plan_stages(pipe):
                 nodes.append(_Node(st, "tap", name=name, show=spec == "tee", env=env))
             else:
                 if not last: raise SyntaxError(f"{name}=@function must be the last stage")
-                if spec is None: fn, label = _evaluate(w[1][1]), f"@({w[1][1]})"
+                if spec is None: fn, label = _evaluate(w[1][1]), "@" + w[1][1] if w[1][0] == "call" else f"@({w[1][1]})"
                 else:
                     if not _AT_NAME.match("@" + spec): raise SyntaxError(f"bad function name @{spec} (use @(...) for an expression)")
                     fn, label = _lookup(spec), "@" + spec
@@ -1349,14 +1494,15 @@ def plan_stages(pipe):
             nodes.append(_Node(st, "tap", show=True, env=env)); special = True
             continue
         at = _AT_NAME.match(first_text) if single and first_kind == "lit" else None
-        if (single and first_kind == "py" and i == 0 and len(words) == 1 and not _has_input(st)
+        if (single and first_kind in ("py", "call") and i == 0 and len(words) == 1 and not _has_input(st)
                 and (len(pipe) > 1 or _has_output(st))):
             # `@(...) | cmd`: always a source.  Evaluate it inside the stage, where print() reaches the pipe.
-            nodes.append(_Node(st, "expr", expr=first_text, label=f"@({first_text})", source=True, env=env)); special = True
+            label = "@" + first_text if first_kind == "call" else f"@({first_text})"
+            nodes.append(_Node(st, "expr", expr=first_text, label=label, source=True, env=env)); special = True
             continue
-        if at or (single and first_kind == "py" and (len(pipe) > 1 or st.redirs)):
+        if at or (single and first_kind in ("py", "call") and (len(pipe) > 1 or st.redirs)):
             obj = _lookup(at.group(1)) if at else _evaluate(first_text)
-            label = first_text if at else f"@({first_text})"
+            label = first_text if at else "@" + first_text if first_kind == "call" else f"@({first_text})"
             source = i == 0 and not _has_input(st)
             if callable(obj):
                 nodes.append(_Node(st, "call", fn=obj, label=label, args=_words(words[1:]), source=source, env=env))
@@ -1367,6 +1513,7 @@ def plan_stages(pipe):
                 nodes.append(_Node(st, "data", value=obj, label=label, env=env)); special = True
                 continue
             if at: raise TypeError(f"{label} is not callable")
+            if first_kind == "call": raise TypeError(f"{label} did not return a function")
             values = obj if isinstance(obj, (list, tuple, set)) else [obj]              # splice, as before
             words = [[("sq", str(v))] for v in values] + words[1:]
         argv = _words(words)
@@ -1400,7 +1547,8 @@ def _write_result(value, out):
         if streaming: return seen if out.keeps else None       # consumed and not remembered: nothing to hand back
         return value
     else:
-        s = str(value); out.write(s if s.endswith("\n") else s + "\n")
+        s = str(value)
+        if s: out.write(s if s.endswith("\n") else s + "\n")            # an empty result prints nothing, not a blank line
     return value
 
 class _Out:
@@ -1724,6 +1872,7 @@ def run_python_pipeline(nodes, capture, capture_err, background, cmdline, tee, s
         res = Result(status, out, err, time.time() - t0, cmdline)
         res.no_match = no_match
         res.value = value
+        res._statuses = [n.status for n in nodes]
         if killer: killer.cancel(); res.timed_out = killer.fired
         if final.kind == "call" and not final.name and value is not None and _at_prompt and not capture and not tee \
                 and not isinstance(value, collections.abc.Iterator) and not (isinstance(value, list) and not value and final.status):
@@ -1956,7 +2105,8 @@ def classify(line):
     try: code = codeop.compile_command(py, "<pysh>", "single")
     except (SyntaxError, ValueError, OverflowError): return "sh"
     if code is None:                                  # unfinished: an open bracket/string, or a block header
-        return "sh" if (w and w not in ns and is_command(w)) else "py"
+        if (w in ns or hasattr(builtins, w)) and s[len(w):].startswith("("): return "py"     # `print(` carrying on, whatever
+        return "sh" if (w and w not in ns and is_command(w)) else "py"                        # programs are on $PATH
     try: tree = ast.parse(py)
     except SyntaxError: return "sh"
     if tree.body and all(isinstance(x, ast.Expr) for x in tree.body) and w:
@@ -1965,7 +2115,7 @@ def classify(line):
         looks_call = s[len(w):].lstrip().startswith("(")
         if (w in unbound or (unbound and w in ns is False)) and is_command(w) and not looks_call: return "sh"
         if unbound and not looks_call and is_command(w) and w not in ns: return "sh"
-        if unbound and hasattr(builtins, w) and w not in ns and shutil.which(w) and not looks_call: return "sh"
+        if unbound and hasattr(builtins, w) and w not in ns and not looks_call and on_path(w): return "sh"
     return "py"
 
 def run_python(src):
@@ -2252,7 +2402,10 @@ def complete(before):
     stage = re.split(r"\|\||&&|[|;&]", head)[-1].split()
     first = not stage
     items, nospace = [], False          # items: (insert_word, display, desc)
-    if word.startswith("$") and not word.startswith("$("):
+    custom = None if first or word.startswith("$") else _custom_completions(word, stage)
+    if custom is not None:
+        items = custom
+    elif word.startswith("$") and not word.startswith("$("):
         items = [("$" + k, "$" + k, v[:40]) for k, v in sorted(os.environ.items()) if k.startswith(word[1:])]
     elif first and "/" not in word and "." not in word and not word.startswith("~") and word:
         seen = {}
@@ -2266,7 +2419,8 @@ def complete(before):
         for d in os.environ.get("PATH", "").split(":"):
             if any(d == x or d.startswith(x + "/") for x in skip): continue
             try:
-                for f in os.listdir(d):
+                listed = command_index.names(d)
+                for f in (os.listdir(d) if listed is None else listed):
                     if not f.lower().endswith(ns["complete_ignore"]): seen.setdefault(f, None)
             except OSError: pass
         man = man_desc() if any(v is None and k.startswith(word) for k, v in seen.items()) else {}
@@ -2303,6 +2457,22 @@ def complete(before):
     common = os.path.commonprefix([w for w, _, _ in items])
     return head + common, out
 
+def _custom_completions(word, stage):
+    """items from a registered completer, or None to complete as usual"""
+    fn = completers.get(stage[0])
+    if fn is None: return None
+    try:
+        offered = fn(word, stage[1:])
+        if offered is None: return None
+        items = []
+        for entry in offered:
+            text, desc = entry if isinstance(entry, tuple) else (entry, "")
+            text = str(text)
+            if text.startswith(word) and not _CTRL.search(text) and "\n" not in text and "\t" not in text:
+                items.append((_esc(text), text, clean(str(desc))[:70]))
+        return items
+    except Exception: return None                          # a broken completer must not break the editor
+
 def search_history(query):
     """Ctrl-R: newest-first, de-duplicated, case-insensitive substring matches."""
     q, seen, out = query.lower(), set(), []
@@ -2325,6 +2495,31 @@ def _history_encode(entry):
 def _history_decode(line):
     if not line.startswith(_HIST_MULTI): return line
     return re.sub(r"\\([\\nr])", lambda m: {"n": "\n", "r": "\r"}.get(m.group(1), "\\"), line[1:])
+
+_RECORD_LIMIT = 20000
+
+def history_record():
+    """where each command's time, directory and exit status are kept (for pyshlib's `hist`)"""
+    return HIST + ".jsonl"
+
+def record_history(line, cwd, started, status):
+    if line.startswith(" ") or not line.strip(): return          # same rule as the history file
+    try:
+        fd = os.open(history_record(), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(json.dumps({"cmd": str(line), "time": round(started, 2), "cwd": cwd, "status": status}) + "\n")
+    except (OSError, ValueError): pass
+
+def trim_record():
+    """keep the record from growing for ever: the newest entries, once it passes a few megabytes"""
+    path = history_record()
+    try:
+        if os.path.getsize(path) <= 4_000_000: return
+        with open(path, errors="replace") as f: keep = f.readlines()[-_RECORD_LIMIT:]
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".pysh-record-")
+        with os.fdopen(fd, "w") as f: f.writelines(keep)
+        os.replace(tmp, path)
+    except OSError: pass
 
 def load_history():
     try:
@@ -2396,7 +2591,10 @@ def read_entry(tty):
     lines = []
     def rl(p):
         if tty:
-            got = _pyshline.readline(p, history, complete, suggest, highlight, search_history)
+            global _typing
+            _typing = True
+            try: got = _pyshline.readline(p, history, complete, suggest, highlight, search_history)
+            finally: _typing = False
             if isinstance(got, tuple): raise _EditRequest(got[0])
             return got
         sys.stdout.flush()
@@ -2406,6 +2604,7 @@ def read_entry(tty):
     try:
         if INTERACTIVE: reap_jobs(notify=True)
         _cmdcache.clear()
+        command_index.refresh()
         older = ns.get("prompt")                         # a `prompt` string or function still wins over PS1
         text = prompt() if older is None else str(older() if callable(older) else older)
         above, newline, text = text.rpartition("\n")    # the line editor draws one line; print any earlier ones first
@@ -2454,6 +2653,7 @@ PS1 = "@PS1@"
 
 # Examples
 # export EDITOR=nano                       # Alt-E opens $EDITOR (default vim)
+# from pyshlib import table, where, freq   # extras; or: from pyshlib import *   (see `man pysh`)
 # export PATH=~/bin:$PATH
 # alias ll='ls -l'
 # def PS1(): return $(date +%H:%M) + " > "        # a function can compute anything
@@ -2501,11 +2701,13 @@ def repl(interactive=False, norc=False):
     if tty:
         init_job_control()
         load_history()
+        trim_record()
         os.environ.setdefault("EDITOR", "vim")                      # Alt-E, git and friends; ~/.pyshrc can change it
     if (tty or interactive) and not norc:
         try: run_rc(create=tty)
         except SystemExit as e: hup_jobs(); return exit_status(e)        # `exit` in an rc file leaves, as in bash
     drop_import_cwd()
+    if tty: command_index.start()                                   # after the rc file, which may change $PATH
     internal_errors = 0
     while True:
         try: line = read_entry(tty)
@@ -2523,11 +2725,13 @@ def repl(interactive=False, norc=False):
         if tty: save_history(line)
         _exit_warned = False if not line.strip().startswith(("exit", "quit")) else _exit_warned
         _at_prompt = True
+        where_run, started = logical_cwd() if tty else "", time.time()
         try: run_block(line) if isinstance(line, Block) else run_line(line)
         except SystemExit as e: hup_jobs(); return exit_status(e)
-        except KeyboardInterrupt: print()
+        except KeyboardInterrupt: print(); _setlast(Result(130, cmd=line))
         except Exception as e:
             sh_error(f"internal error: {type(e).__name__}: {e}"); _setlast(Result(70, cmd=line))
+        if tty: record_history(line, where_run, started, last.returncode)
     if tty: print()
     hup_jobs()
     return last.returncode

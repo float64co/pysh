@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 
 #include "pysh_py.h"
+#include "pyshlib_py.h"
 
 #ifndef PYSH_HOME
 #define PYSH_HOME "/usr"
@@ -31,16 +32,24 @@ static int pushback = -1;                 /* a key read ahead while coalescing t
 
 /* Next byte of input.  Returns -1 on timeout, -2 on EOF/error, and -3 (blocking reads only) when the
  * terminal was resized, so the editor can repaint. */
+/* Waiting for a key releases the GIL: Python threads (the $PATH index, the user's own) keep running at the prompt. */
 static int key(int timeout_ms) {
     unsigned char c;
     if (pushback >= 0) { c = (unsigned char)pushback; pushback = -1; return c; }
     if (timeout_ms >= 0) {
         struct pollfd p = {0, POLLIN, 0};
-        if (poll(&p, 1, timeout_ms) <= 0) return -1;
+        int ready;
+        Py_BEGIN_ALLOW_THREADS
+        ready = poll(&p, 1, timeout_ms);
+        Py_END_ALLOW_THREADS
+        if (ready <= 0) return -1;
     }
     for (;;) {
         if (g_winch && timeout_ms < 0) return -3;               /* a resize arrived while we weren't reading */
-        ssize_t n = read(0, &c, 1);
+        ssize_t n;
+        Py_BEGIN_ALLOW_THREADS
+        n = read(0, &c, 1);                                     /* errno survives taking the GIL back */
+        Py_END_ALLOW_THREADS
         if (n == 1) return c;
         if (n == 0) return -2;
         if (errno == EINTR) { if (g_winch && timeout_ms < 0) return -3; continue; }
@@ -379,7 +388,7 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
         if (c == -3) {                                     /* the terminal was resized */
             int W, H, row = 0, col = 0, tw = 0, have, oldW = g_w, mode;       /* mode: 0 reflowed, 1 unchanged, 2 unknown */
             for (int tries = 0;; tries++) {
-                do { g_winch = 0; poll(NULL, 0, 80); } while (g_winch);       /* a drag sends a burst: let it settle */
+                do { g_winch = 0; Py_BEGIN_ALLOW_THREADS poll(NULL, 0, 80); Py_END_ALLOW_THREADS } while (g_winch);       /* a drag sends a burst: let it settle */
                 term_size(&W, &H);
                 have = probe_terminal(&row, &col, &tw);
                 if (have == 0 && tries < 8) continue;                         /* still changing: look again */
@@ -633,6 +642,11 @@ int main(int argc, char **argv) {
 
     PyObject *m = PyImport_AddModule("__main__");
     PyObject *d = PyModule_GetDict(m);
+    {   /* pyshlib's source: pysh.py makes it importable */
+        PyObject *lib = PyBytes_FromString((const char *)pyshlib_py);
+        if (!lib || PyDict_SetItemString(d, "__pyshlib__", lib) < 0) { PyErr_Print(); Py_XDECREF(lib); Py_Finalize(); return 1; }
+        Py_DECREF(lib);
+    }
     PyObject *r = PyRun_StringFlags((const char *)pysh_py, Py_file_input, d, d, NULL);
     if (!r) {
         if (PyErr_ExceptionMatches(PyExc_SystemExit)) {

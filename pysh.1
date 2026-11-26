@@ -362,6 +362,10 @@ cat data.json | @json.load
 .fi
 .RE
 .PP
+.BI @ name( ... )
+is a call whose result is the stage, as in
+.BR "@where(str.isdigit)" .
+.PP
 Note
 .BR json.load ,
 which reads a stream, not
@@ -468,6 +472,8 @@ A wrapper such as
 .B sudo grep
 hides the command, so the variable is left unchanged.
 .SS Pipeline status
+.B last.statuses
+lists the exit status of every stage.
 A pipeline's status is that of its last stage; with captures, a failure before them makes it non\-zero too.
 With
 .B set_pipefail = True
@@ -569,6 +575,94 @@ A
 timeout stops the programs but cannot interrupt Python running in the shell.
 .B @name
 is not completed or highlighted.
+.SH PYSHLIB
+A module of extras built into pysh and loaded only when imported, for example in
+.IR ~/.pyshrc :
+.PP
+.RS
+.nf
+from pyshlib import table, where, freq
+from pyshlib import *
+.fi
+.RE
+.PP
+An imported name counts as Python from then on.
+A file called
+.I pyshlib.py
+elsewhere is never used instead.
+.SS Stages
+.TP
+.BR @table " [" , "] [" noheader ]
+Aligned columns, the first line as the header; with a separator such as
+.BR , ,
+CSV.
+The result has
+.BR .columns ,
+.BR t[0] ,
+.B t["name"]
+and
+.BR .df() .
+.TP
+.BI @fields " n ..."
+Those whitespace\-separated fields, joined by tabs.
+Counting starts at 1; negative numbers count from the end.
+.TP
+.BI @where( function ) "  " @each( function )
+Keep the lines for which it is true; or write its result for each line, leaving out None.
+.TP
+.BR @freq " [" \fIn\fP ]
+How often each line occurs, commonest first.
+.TP
+.BR @stats " [" \fIfield\fP ]
+count, min, mean, median, p95, max, sum and stdev of the numbers; lines without one are counted as skipped.
+.TP
+.B @jsonl
+An object per JSON line, as lines arrive; bad lines are skipped.
+.TP
+.BR @spark " [" \fIfield\fP ]
+A one\-line chart.
+.TP
+.BR @peek " [" \fIn\fP ]
+Show the first lines on standard error and pass everything on.
+.SS Running in parallel
+.BI par( items ", " command ", jobs=8, timeout=None)"
+runs a command, or calls a function, for every item and returns the results in order; each
+.B Result
+has
+.BR .item .
+In a command
+.B {}
+is the item passed as one argument, so its contents are never read as shell syntax; it must not be quoted.
+An item beginning with
+.B \-
+may still be taken as an option.
+A timeout gives status 124.
+Failing items do not stop a
+.B \-e
+script.
+.SS History, temporary changes and hooks
+.TP
+.B hist.search(text, cwd=, failed=, since=, limit=)
+Commands from the history record, oldest first, each with
+.BR .cmd ", " .time ", " .cwd " and " .status .
+.B hist.last(n)
+gives the newest.
+.TP
+.BI "with in_dir(" path "):"
+Work in another directory, then return.
+.TP
+.BI "with in_env(" NAME=value ", ...):"
+Set variables (None removes), then restore them.
+.TP
+.B @on_cd
+Decorate a function to be called with the new directory after every
+.BR cd .
+.TP
+.BI @completer(\(dq command \(dq)
+Decorate
+.I function(word, args)
+returning strings or (string, description) pairs, offered by Tab for that command's arguments.
+None means complete as usual.
 .SH WORKING DIRECTORY
 .B $PWD
 always names the real working directory.
@@ -934,7 +1028,26 @@ When a command's output does not end with a newline, the next prompt starts on a
 reverse\-video
 .B %
 shows where the output stopped.
+.SH COMMAND INDEX
+Interactive shells keep the names found on
+.B PATH
+in memory, so that judging a half\-typed line does not search every directory on each keystroke
+(which is slow where
+.B PATH
+holds network or Windows directories).
+The directories are listed in the background at startup.
+Before each prompt a directory that is quick to examine is listed again if it changed;
+a slow one is listed again in the background about once a minute.
+The index is only a shortcut: a name found in it is checked on disk, and before a line is run
+a name it does not know is searched for properly.
+Scripts and
+.B \-c
+do not use it.
+Nothing is written to disk.
 .SH SECURITY
+The history record holds commands with the directories they were run in; like the history file it is private,
+and a leading space keeps a command out of both.
+.PP
 .IP \(bu 3
 Completion does not evaluate what is typed: Python attribute completion looks up plain dotted names only.
 .IP \(bu 3
@@ -955,6 +1068,13 @@ Arithmetic is signed 64-bit with wraparound, and brace expansion is limited to 1
 .IP \(bu 3
 Text pasted with embedded newlines is run line by line; there is no bracketed paste.
 .SH FILES
+.TP
+.I ~/.pysh_history.jsonl
+Each interactive command with its time, directory and exit status, read by
+.B pyshlib.hist
+(mode 0600; a command beginning with a space is not recorded).
+It is named after
+.BR PYSH_HISTFILE .
 .TP
 .I ~/.pyshrc
 Shell and Python lines run at interactive startup, like a script.

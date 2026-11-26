@@ -4,7 +4,7 @@ A shell and a Python REPL in one executable. Every line is Python if it parses
 as Python, and a shell command otherwise. It embeds the CPython that is installed
 on your system, so `import` finds the same modules your `python` does.
 Python functions can be [stages in a pipeline](#python-in-pipelines), and a pipeline's result can go
-straight into a variable.
+straight into a variable. Optional [extras](#extras-pyshlib) add table, count and statistics stages and more.
 
 ![pysh screenshot](screenshot.png)
 
@@ -153,7 +153,7 @@ ps aux | grep ssh | hits=@lines
 @(sorted(hits, key=len)) | head -3
 ```
 
-Five forms cover it:
+The forms:
 
 | form | meaning | where |
 |---|---|---|
@@ -162,6 +162,7 @@ Five forms cover it:
 | `name=@` | keep the raw text | any stage |
 | `name=@tee` / `@tee` | keep (or not) and show it as it goes past | any stage |
 | `@rows \| ...` | Python as the source | first stage |
+| `... \| @make(arg)` | call `make(arg)` and use the function it returns | any stage |
 
 ### Stages
 
@@ -189,7 +190,8 @@ ps aux | @grep_re 'ssh|nginx'
 | a list, tuple, generator or other iterator | one item per line |
 | anything else (dict, DataFrame, number) | its printed form |
 
-`@name` takes a dotted name; use `@(...)` for anything else, such as `@(functools.partial(f, 2))`.
+`@name` takes a dotted name. `@name(...)` is a call whose result is the stage, spaces and all:
+`ls | @where(lambda l: "x" in l)`. Use `@(...)` for any other expression.
 `@(...)` is a stage only if its value is callable. If `cmd` holds the string `"wc"`, then `ls | @(cmd) -l`
 still runs the program `wc`.
 Redirections work as usual (`@fn < in.txt > out.txt`, `2> err.txt`, `<<<`, here-documents).
@@ -230,7 +232,7 @@ Add your own such commands with `no_match_commands |= {"mytool"}`. A wrapper hid
 `sudo grep` that finds nothing leaves the variable alone. `sh(..., check=True)` still raises on status 1.
 
 Without a capture, a pipeline's status is its last stage's, so a failing `git` in `git log | @parse` goes
-unnoticed. `set_pipefail = True` (in a script or `~/.pyshrc`) makes any stage's failure count; a command
+unnoticed. `last.statuses` lists every stage's status. `set_pipefail = True` (in a script or `~/.pyshrc`) makes any stage's failure count; a command
 cut off because a later stage stopped reading (`yes | head -1`) doesn't. With `-e` that stops the script.
 
 ### Python as the source
@@ -288,6 +290,78 @@ def users():
 
 See `examples/logwatch.sh`, `examples/apipeek.sh` and `examples/inventory.sh`.
 
+## Extras: pyshlib
+
+`pyshlib` is built into the shell and loaded only when you import it. Put what you want in `~/.pyshrc`:
+
+```python
+from pyshlib import table, where, freq      # just these
+from pyshlib import *                       # or everything
+```
+
+Every name you import counts as Python from then on, so import what you use. `import pyshlib` and
+`@pyshlib.table` work too, in scripts as well.
+
+### Pipeline stages
+
+```python
+ps aux | @table                             # aligned columns; first line is the header
+cat sales.csv | t=@table ,                  # CSV; then t["total"], t[0], t.df()
+df -P | @fields 6 5                         # pick fields (from 1; -1 is the last)
+ls | @where(lambda l: l.endswith(".py"))    # filter lines
+ls | @each(os.path.getsize)                 # map lines, streaming (after: import os)
+cat access.log | @fields 1 | @freq 10       # commonest, with bars
+cat times.txt | s=@stats                    # s.count .min .mean .median .p95 .max .sum .stdev
+tail -f app.jsonl | @jsonl                  # one object per JSON line
+seq 20 | @spark                             # ▁▁▂▂▃▃▄▄▅▅▆▆▇▇██
+make 2>&1 | @peek 3 | grep -c warning       # show the first lines, pass everything on
+```
+
+`@table`, `@freq`, `@stats` and `@spark` give objects that print nicely and can be used from Python when
+assigned. `@table` splits on whitespace and gives the last column the rest of the line; `@table noheader`
+numbers the columns.
+
+### Running things in parallel
+
+```python
+for r in par(["web1", "web2"], "ssh {} uptime", jobs=8):
+    print(r.item, r.returncode, r.out.strip())
+sizes = par(files, os.path.getsize)         # or a function
+```
+
+Results come back in the items' order. In a command, `{}` is the item passed as **one argument**, so `;`,
+`$(...)` or spaces in a filename or hostname do nothing. A quoted `"{}"` is refused. An item starting with `-`
+may still be read as an option; write `-- {}` if that matters. `timeout=` gives status 124, and a failing item
+doesn't stop a `-e` script.
+
+### History, temporary changes, hooks, completion
+
+```python
+hist.search("docker", cwd=".", failed=True, since=3600)   # also limit=N; hist.last(20)
+
+with in_dir("/tmp"):                                      # and back again
+    $[make]
+with in_env(CC="clang", DEBUG=None):                      # None removes a variable
+    $[make]
+
+@on_cd                                                    # runs after every cd
+def auto_venv(path):
+    if os.path.isdir(".venv"): $[activate .venv]
+
+@completer("deploy")                                      # your own Tab completion
+def deploy_targets(word, args):
+    return ["staging", ("production", "careful!")]
+```
+
+`hist` reads a record that interactive shells keep in `~/.pysh_history.jsonl` (private, mode 0600): each
+command with its time, directory and exit status. A command typed with a leading space is left out. It starts
+empty, so commands from before this version have no details.
+
+`last.statuses` (no import needed) gives the exit status of every stage of the last pipeline.
+
+Examples: [`fleet.sh`](examples/fleet.sh), [`logstats.sh`](examples/logstats.sh),
+[`histreport.sh`](examples/histreport.sh), and [`examples/pyshrc`](examples/pyshrc) for hooks and completion.
+
 ## Scripts
 
 Start a file with a shebang and `chmod +x` it:
@@ -306,7 +380,7 @@ script unless you use `#!/usr/bin/pysh -e` (or `pysh -e script`). A Python block
 unindented line, so shell lines can follow it directly.
 
 `sys.exit(3)` sets the exit status; `sys.exit("message")` prints the message to standard error and exits 1,
-as in Python. Eighteen complete, tested scripts are in [`examples/`](examples/) (disk usage, TLS expiry
+as in Python. Twenty-one complete, tested scripts are in [`examples/`](examples/) (disk usage, TLS expiry
 checks, flaky-test detection, import graphs, a local-LLM commit-message drafter, a CPU-vs-GPU benchmark with CuPy, and more); each
 supports `--help`.
 
@@ -314,6 +388,10 @@ supports `--help`.
 
 - **Autosuggestions**: grey text from history. `→`/`End`/`Ctrl-F` accept, `Alt-F` takes a word.
 - **Highlighting**: strings yellow, numbers and operators cyan, Python keywords blue, paths underlined. Program names keep the plain colour of their arguments.
+- **Fast on a slow `$PATH`**: command names are indexed in memory (listed in the background at startup and
+  refreshed as directories change), so typing never searches `$PATH`. Under WSL, where Windows directories make
+  one search take ~50 ms, that matters. A stale index can't misread a line: before treating a name as "not a
+  command", pysh really searches.
 - **Tab completion menu** with descriptions: commands from man pages, files by type/size,
   Python attributes by type, flags parsed from `cmd --help`. Tab cycles, Enter runs the selection, Esc cancels.
 - **Pasting**: text that arrives in one go (a paste, or typing ahead while a command runs) is inserted in one step and repainted once, so large pastes are fast.

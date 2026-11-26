@@ -745,3 +745,25 @@ class AliasPositions(Base):
         self.check("alias run='env '\nrun run hi", "HI")                # each word typed by you is expanded afresh
         self.check("alias echo='echo '\necho echo z", "echo z")
         self.check("alias a='echo '\nalias b='c '\nalias c='b '\na b", "b")
+
+
+class MultiLineCalls(Base):
+    """A call left open at the end of a line is Python, even if a program shares the function's name."""
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.d, ignore_errors=True))
+        for name in ("print", "len", "mine"):                       # programs that would shadow them
+            path = os.path.join(self.d, name)
+            with open(path, "w") as f: f.write("#!/bin/sh\necho PROGRAM\n")
+            os.chmod(path, 0o755)
+        self.env = {"PATH": self.d + os.pathsep + os.environ["PATH"]}
+
+    def test_builtins_and_own_functions(self):
+        script = 'print("a"\n      "b")\nprint(\n  len(\n    [1, 2]))\ndef mine(*a): print("own", *a)\nmine(1,\n     2)\n'
+        for mode in ("file", "c"):
+            with self.subTest(mode=mode):
+                r = run(script, mode=mode, env=self.env)
+                self.assertEqual((r.out.split(), r.err), (["ab", "2", "own", "1", "2"], ""), msg=repr(r))
+
+    def test_the_program_is_still_reachable(self):
+        self.assertEqual(run("print x\n", env=self.env).out.strip(), "PROGRAM")

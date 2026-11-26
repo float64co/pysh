@@ -1,7 +1,9 @@
 """The scripts in examples/: each has the right shebang, answers --help, and does its job."""
-import glob, importlib.util, os, shutil, socket, subprocess, sys, tempfile, threading, unittest
+import time
+import glob, importlib.util, json, os, shutil, socket, subprocess, sys, tempfile, threading, unittest
 
 from helpers import PYSH, ROOT
+from term import Session
 
 EX = os.path.join(ROOT, "examples")
 SCRIPTS = sorted(glob.glob(os.path.join(EX, "*.sh")))
@@ -36,7 +38,7 @@ def git(cwd, *args):
 
 class Every(unittest.TestCase):
     def test_there_are_examples(self):
-        self.assertGreaterEqual(len(SCRIPTS), 18)
+        self.assertGreaterEqual(len(SCRIPTS), 21)
 
     def test_shebang_and_executable(self):
         for p in SCRIPTS:
@@ -571,6 +573,145 @@ class Inventory(unittest.TestCase):
 
     def test_bad_top(self):
         self.assertEqual(example("inventory.sh", "-n", "0").returncode, 2)
+
+
+class Fleet(unittest.TestCase):
+    def test_local_checks(self):
+        r = example("fleet.sh")
+        self.assertEqual(r.returncode, 0, r.all)
+        for word in ("TARGET", "uptime", "kernel", "root-disk", "ok"): self.assertIn(word, r.stdout)
+
+    def test_hosts_go_through_ssh_as_single_arguments(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, "ssh")
+            with open(fake, "w") as f:
+                f.write('#!/bin/sh\nfor x in "$@"; do printf "<%s>" "$x" >> "$LOG"; done; echo >> "$LOG"\n'
+                        'case "$*" in *bad*) echo "no route \033]0;pwned\007" >&2; exit 255;; esac\necho "line one"; echo "line two"\n')
+            os.chmod(fake, 0o755)
+            log = os.path.join(d, "log")
+            hosts = os.path.join(d, "hosts")
+            with open(hosts, "w") as f: f.write("# fleet\nbad-host\n;touch${IFS}x\n")
+            r = example("fleet.sh", "web1", "-f", hosts, "-c", "uname -a; id", "--full", cwd=d,
+                        env={"PATH": d + os.pathsep + os.environ["PATH"], "LOG": log})
+            self.assertEqual(r.returncode, 1, r.all)
+            self.assertIn("1 of 3 failed", r.stderr)
+            self.assertIn("(+1 more)", r.stdout); self.assertIn("exit-255", r.stdout)
+            self.assertNotIn("\x1b]0;pwned", r.all)
+            with open(log) as f: calls = f.read()
+            self.assertIn("<--><web1><uname -a; id>", calls)
+            self.assertIn("<--><;touch${IFS}x><uname -a; id>", calls)          # one argument, never run
+            self.assertFalse(os.path.exists(os.path.join(d, "x")))
+
+    def test_bad_arguments(self):
+        self.assertEqual(example("fleet.sh", "--", "-oProxyCommand=id").returncode, 2)
+        self.assertEqual(example("fleet.sh", "-j", "0").returncode, 2)
+        self.assertEqual(example("fleet.sh", "-f", "/no/such").returncode, 1)
+
+
+class LogStats(unittest.TestCase):
+    def log(self, text):
+        with tempfile.NamedTemporaryFile("w", delete=False) as f: f.write(text)
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_demo(self):
+        r = example("logstats.sh", "-n", "3")
+        self.assertEqual(r.returncode, 0, r.all)
+        for word in ("600 lines (access format)", "busiest clients", "10.0.0.5", "status codes", "count 600", "over the file:", "server errors"):
+            self.assertIn(word, r.stdout)
+
+    def test_access_log_without_timings(self):
+        path = self.log('1.1.1.1 - - [x +0000] "GET /a HTTP/1.1" 200 -\n2.2.2.2 - - [x +0000] "GET /a HTTP/1.1" 503 -\n')
+        r = example("logstats.sh", path)
+        self.assertEqual(r.returncode, 0, r.all)
+        self.assertIn("2 lines", r.stdout); self.assertIn("1 server errors", r.stdout); self.assertIn("no timings", r.stdout)
+
+    def test_json_log_with_hostile_values(self):
+        path = self.log('{"ip":"a","status":500,"path":"/\\u001b]0;pwned\\u0007","ms":5}\nnot json\n{"ip":"a","status":200,"ms":"7"}\n')
+        r = example("logstats.sh", path)
+        self.assertEqual(r.returncode, 0, r.all)
+        self.assertIn("2 lines (json format)", r.stdout); self.assertIn("count 2", r.stdout)
+        self.assertNotIn("\x1b]0;pwned", r.stdout)
+
+    def test_missing_and_empty(self):
+        self.assertEqual(example("logstats.sh", "/no/such").returncode, 1)
+        self.assertEqual(example("logstats.sh", self.log("")).returncode, 1)
+        self.assertEqual(example("logstats.sh", "-n", "0").returncode, 2)
+
+
+class HistReport(unittest.TestCase):
+    def test_demo(self):
+        r = example("histreport.sh", "--demo")
+        self.assertEqual(r.returncode, 0, r.all)
+        self.assertEqual(r.stderr, "")
+        for word in ("240 commands", "what you run", "git", "where", "what keeps failing", "typos?): gti", "by hour of day"):
+            self.assertIn(word, r.stdout)
+
+    def test_reads_the_real_record_and_filters(self):
+        with tempfile.TemporaryDirectory() as d:
+            here = os.path.realpath(d)
+            with open(os.path.join(d, "h.jsonl"), "w") as f:
+                f.write(json.dumps({"cmd": "X=1 sudo make", "time": time.time(), "cwd": here, "status": 2}) + "\n")
+                f.write(json.dumps({"cmd": "old thing", "time": time.time() - 30 * 86400, "cwd": "/", "status": 0}) + "\n")
+            env = {"PYSH_HISTFILE": os.path.join(d, "h")}
+            self.assertIn("2 commands", example("histreport.sh", env=env).stdout)
+            r = example("histreport.sh", "--days", "1", "--here", env=env, cwd=here)
+            self.assertIn("1 commands", r.stdout); self.assertIn("make", r.stdout); self.assertNotIn("old", r.stdout)
+
+    def test_nothing_recorded(self):
+        r = example("histreport.sh", env={"PYSH_HISTFILE": "/no/such/history"})
+        self.assertEqual(r.returncode, 0, r.all)
+        self.assertIn("--demo", r.stdout)
+
+
+class SamplePyshrc(unittest.TestCase):
+    """examples/pyshrc loaded as a real ~/.pyshrc"""
+    def setUp(self):
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="pysh-test-"))
+        self.addCleanup(shutil.rmtree, self.home, True)
+        shutil.copy(os.path.join(EX, "pyshrc"), os.path.join(self.home, ".pyshrc"))
+        self.proj = os.path.join(self.home, "proj")
+        os.makedirs(os.path.join(self.proj, "sub"))
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", os.path.join(self.proj, ".venv")], check=True)
+        with open(os.path.join(self.proj, "Makefile"), "w") as f: f.write("build: x\n\ttrue\nV := 1\nbench:\n\ttouch SHOULD_NOT\n")
+        subprocess.run(["git", "init", "-q", self.proj], check=True)
+        git(self.proj, "commit", "-q", "--allow-empty", "-m", "x"); git(self.proj, "branch", "feature-one")
+        self.s = Session(rows=50, cols=100, home=self.home, env={"VIRTUAL_ENV": ""})
+        self.addCleanup(self.s.close)
+
+    def send(self, line, wait=1.0):
+        self.s.send(line, wait)
+        return self.s.text()
+
+    def last_line(self): return self.s.text().rstrip().split("\n")[-1]
+
+    def test_loads_cleanly(self):
+        self.assertNotIn("Error", self.s.text())
+
+    def test_venv_is_asked_about_once_then_follows_cd(self):
+        self.assertIn("it can run code [y/N]", self.send("cd proj\r"))
+        self.send("\r")                                           # the default is no
+        self.assertNotIn("(.venv)", self.last_line())
+        self.send("cd ..\r"); self.send("cd proj\r"); self.send("y\r")
+        self.assertIn("(.venv)", self.last_line())
+        self.send("cd sub\r"); self.assertIn("(.venv)", self.last_line())
+        self.send("cd ../..\r"); self.assertNotIn("(.venv)", self.last_line())
+        self.send("clear\r", 0.5)
+        text = self.send("cd proj\r")
+        self.assertNotIn("[y/N]", text); self.assertIn("(.venv)", self.last_line())
+        trusted = os.path.join(self.home, ".config", "pysh", "trusted_venvs")
+        self.assertEqual(os.stat(trusted).st_mode & 0o777, 0o600)
+
+    def test_completion_and_helpers(self):
+        self.send("cd proj\r"); self.send("\r")
+        self.send("git switch fea\t")
+        self.assertTrue(self.last_line().endswith("git switch feature-one"), self.s.text())
+        self.send("\x15", 0.4)
+        self.assertIn("bench", self.send("make b\t"))
+        self.send("\x1b", 0.5); self.send("\x15", 0.4)
+        self.assertFalse(os.path.exists(os.path.join(self.proj, "SHOULD_NOT")))
+        self.send("false\r")
+        self.assertRegex(self.send("failed(1)\r"), r"\[1\] ~/proj  false")
 
 
 @unittest.skipUnless(have("cupy"), "needs cupy")

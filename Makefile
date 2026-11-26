@@ -11,7 +11,7 @@ PYLIBS := $(shell $(PYTHON)-config --ldflags --embed)
 PYHOME := $(shell $(PYTHON) -c 'import sys;print(sys.base_prefix)')
 LIBPL  := $(shell $(PYTHON) -c 'import sysconfig;print(sysconfig.get_config_var("LIBPL"))')
 LIBPYA := $(LIBPL)/$(shell $(PYTHON) -c 'import sysconfig;print(sysconfig.get_config_var("LIBRARY"))')
-SRC    := pysh.c sha2_shim.c pysh_py.h
+SRC    := pysh.c sha2_shim.c pysh_py.h pyshlib_py.h
 CC_PY   = $(CC) $(CFLAGS) -Wall -DPYSH_HOME='"$(PYHOME)"' -o $@ pysh.c sha2_shim.c $(PYINC)
 
 pysh: $(SRC)
@@ -29,6 +29,11 @@ pysh_py.h: pysh.py
 	  echo 'static const unsigned char *const pysh_py = pysh_py_bytes;' ) > $@.tmp
 	sed -i 's/}; *$$/, 0};/' $@.tmp 2>/dev/null; mv $@.tmp $@
 
+pyshlib_py.h: pyshlib.py
+	( xxd -i -n pyshlib_py_bytes $< | sed 's/^unsigned char/static const unsigned char/;/_len =/d'; \
+	  echo 'static const unsigned char *const pyshlib_py = pyshlib_py_bytes;' ) > $@.tmp
+	sed -i 's/}; *$$/, 0};/' $@.tmp 2>/dev/null; mv $@.tmp $@
+
 PREFIX ?= /usr/local
 install: pysh
 	install -Dm755 pysh $(DESTDIR)$(PREFIX)/bin/pysh
@@ -39,7 +44,7 @@ install-static: pysh-static
 	install -Dm644 pysh.1 $(DESTDIR)$(PREFIX)/share/man/man1/pysh.1
 
 clean:
-	rm -f pysh pysh-static pysh-dynamic pysh_py.h
+	rm -f pysh pysh-static pysh-dynamic pysh_py.h pyshlib_py.h
 .PHONY: static clean install install-static
 
 # Tests run against ./pysh by default; PYSH=./pysh-static make test to try the other build.

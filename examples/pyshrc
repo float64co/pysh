@@ -1,0 +1,85 @@
+# Sample pieces for ~/.pyshrc using pyshlib. Copy the parts you want; each section stands alone
+# once you have the import lines. This file is not run for you.
+
+import os, re, sys
+from pyshlib import completer, hist, in_dir, in_env, on_cd, par, table, where, each, freq, stats, spark
+
+# ---------------------------------------------------------------- small helpers
+def listening():
+    """what is listening on TCP, as a table:  listening()"""
+    return !(ss -H -ltn | @table noheader).value
+
+def failed(n=10):
+    """the last commands that failed:  failed()"""
+    return hist.search(failed=True, limit=n)
+
+def todos(pattern="TODO|FIXME"):
+    """count TODO markers per file in this repository:  todos()"""
+    return !(git grep -n -E @(pattern) | @(lambda f: freq(line.split(":")[0] for line in f))).value
+
+def py():
+    """Python files here:  py()"""
+    return !(ls | @where(lambda name: name.endswith(".py")) | @lines).value
+
+# ---------------------------------------------------------------- activate a project's .venv on `cd`
+# Activating a virtualenv can run code from it (its .pth files), so a venv you haven't approved is
+# asked about first, once. Approvals are kept in ~/.config/pysh/trusted_venvs.
+_TRUSTED = os.path.expanduser("~/.config/pysh/trusted_venvs")
+_auto_venv = None                     # the one this hook activated
+
+def _trusted(venv):
+    try:
+        with open(_TRUSTED) as f: return venv in f.read().split("\n")
+    except OSError: return False
+
+def _trust(venv):
+    os.makedirs(os.path.dirname(_TRUSTED), mode=0o700, exist_ok=True)
+    with os.fdopen(os.open(_TRUSTED, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a") as f: f.write(venv + "\n")
+
+def _venv_above(path):
+    """the nearest .venv in this directory or a parent, if it is a real virtualenv that you own"""
+    while True:
+        candidate = os.path.join(path, ".venv")
+        if os.path.isfile(os.path.join(candidate, "pyvenv.cfg")) and os.stat(candidate).st_uid == os.getuid():
+            return os.path.realpath(candidate)
+        parent = os.path.dirname(path)
+        if parent == path: return None
+        path = parent
+
+@on_cd
+def auto_venv(path):
+    global _auto_venv
+    found = _venv_above(path)
+    active = os.environ.get("VIRTUAL_ENV")
+    if _auto_venv and active == _auto_venv and found != _auto_venv:      # left the project
+        shell.deactivate_venv(); _auto_venv = None; active = None
+    if not found or active: return                                      # nothing here, or you chose one yourself
+    if not _trusted(found):
+        if not sys.stdin.isatty(): return
+        shown = re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", found)
+        try: answer = input(f"activate the virtualenv {shown}? it can run code [y/N] ")
+        except (EOFError, KeyboardInterrupt): print(); return
+        if answer.strip().lower() not in ("y", "yes"): return
+        _trust(found)
+    if shell.activate_venv(found) == 0: _auto_venv = found
+
+# ---------------------------------------------------------------- Tab completion
+@completer("git")
+def complete_git(word, args):
+    if not args:
+        return [("status", "what has changed"), ("switch", "change branch"), ("commit", "record changes"),
+                ("diff", "show changes"), ("log", "history"), ("pull", "fetch and merge"), ("push", "publish"),
+                ("add", "stage files"), ("branch", "list or make branches"), ("merge", "join branches"),
+                ("rebase", "replay commits"), ("checkout", "switch or restore"), ("stash", "set changes aside")]
+    if args[0] in ("switch", "checkout", "merge", "rebase", "branch") and not word.startswith("-"):
+        r = !(git branch --format=%(refname:short))
+        return [(name, "branch") for name in r.out.split()] if r else None
+    return None                                   # anything else: complete as usual (files, flags)
+
+@completer("make")
+def complete_make(word, args):
+    # read the Makefile as text; running make to list targets could execute code in it
+    try:
+        with open("Makefile", errors="replace") as f: text = f.read()
+    except OSError: return None
+    return [(name, "target") for name in dict.fromkeys(re.findall(r"^([A-Za-z0-9][\w./-]*)\s*:(?![=:])", text, re.M))]

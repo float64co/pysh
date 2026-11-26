@@ -1,6 +1,6 @@
 # pysh examples
 
-Eighteen working scripts that each mix shell commands and Python in one file. Every one starts with
+Twenty-one working scripts that each mix shell commands and Python in one file. Every one starts with
 `#!/usr/local/bin/pysh`, takes `--help`, and runs with no arguments (or fails with a clear usage
 message, where it needs a target). They use only libraries that are already installed with the
 system Python: pandas, numpy, scipy, rich, psutil, networkx, cryptography, lxml, jinja2, pwntools,
@@ -29,6 +29,20 @@ If `pysh` isn't installed at `/usr/local/bin/pysh`, use the second form or edit 
 | `logwatch.sh` | follow a log, filter it, count by level | a pipeline made only of Python: `@source \| @matching \| @report` |
 | `apipeek.sh` | fetch JSON and describe its shape | `curl … \| raw=@ \| data=@as_json`, nothing assigned if the fetch fails |
 | `inventory.sh` | memory by user, biggest processes, full disks | `ps … \| procs=@parse_ps`, `@(rows) \| sort \| head`, `$[…]` inside a block |
+| `fleet.sh` | run a command on many hosts at once (or checks on this one) | `par`, `@table`, `in_env` from `pyshlib` |
+| `logstats.sh` | clients, status codes and latency from an access or JSON-lines log | `@fields`, `@freq`, `@jsonl`, `stats`, `spark` |
+| `histreport.sh` | what you run, where, and what keeps failing | `hist`, `@freq`, `spark` |
+
+## `pyshrc`: startup-file pieces
+
+[`pyshrc`](pyshrc) is not a script. It holds sample pieces for your `~/.pyshrc`, for the parts of `pyshlib`
+that only make sense at a prompt. Copy what you want:
+
+- an `@on_cd` hook that activates a project's `.venv` and deactivates it when you leave. Activating a venv
+  can run code from it, so it asks the first time it sees one and remembers the answer.
+- Tab completion for `git` subcommands and branches, and for `make` targets (read from the Makefile, not by
+  running `make`).
+- small helpers: `listening()`, `failed()`, `todos()`, `py()`.
 
 ## Things to know
 

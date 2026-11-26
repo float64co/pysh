@@ -2505,34 +2505,168 @@ def _highlight(buf):
     w = buf.strip()
     if kind == "py" and re.fullmatch(r"[A-Za-z_][\w.+-]*", w) and w not in ns and not hasattr(builtins, w) and not keyword.iskeyword(w):
         kind = "sh"                       # a bare word that is neither a variable nor builtin: judge it as a command
-    if kind == "py":
-        for m in _PYTOK.finditer(buf):
-            k, t = m.lastgroup, m.group()
-            if k == "str": out.append(C(33, t))
-            elif k == "cm": out.append(C(90, t))
-            elif k == "n": out.append(C(36, t))
-            elif k == "w" and keyword.iskeyword(t): out.append(C(34, t))
-            elif k == "w" and t in ns and callable(ns[t]) or k == "w" and hasattr(builtins, t) and callable(getattr(builtins, t)): out.append(C(36, t))
-            else: out.append(t)
-        return "".join(out)
+    if kind == "py": return _highlight_py(buf)
     return highlight_sh(buf)
+
+def _highlight_py(buf):
+    out = []
+    for m in _PYTOK.finditer(buf):
+        k, t = m.lastgroup, m.group()
+        if k == "str": out.append(C(33, t))
+        elif k == "cm": out.append(C(90, t))
+        elif k == "n": out.append(C(36, t))
+        elif k == "w" and keyword.iskeyword(t): out.append(C(34, t))
+        elif k == "w" and t in ns and callable(ns[t]) or k == "w" and hasattr(builtins, t) and callable(getattr(builtins, t)): out.append(C(36, t))
+        else: out.append(t)
+    return "".join(out)
+
+# --------------------------------------------------------------- @name: what is it, without running anything
+_NOT_STAGES = {"sh", "shell", "aliases", "Result", "ShellError", "Process", "last", "prompt", "PS1"}    # pysh's own
+
+def _static_lookup(name):
+    """-> (state, object) for a dotted name: "callable", "value", "missing", or "unsure" when finding out would
+    mean running code (a property, a module's __getattr__)."""
+    first, *rest = name.split(".")
+    if first in ns: obj = ns[first]
+    elif hasattr(builtins, first): obj = getattr(builtins, first)
+    else: return "missing", None
+    for part in rest:
+        try: obj_next = inspect.getattr_static(obj, part)
+        except AttributeError:
+            dynamic = inspect.getattr_static(obj, "__getattr__", None) is not None
+            return ("unsure" if dynamic else "missing"), None
+        if isinstance(obj_next, (property, types.MemberDescriptorType, types.GetSetDescriptorType)): return "unsure", None
+        if isinstance(obj_next, (staticmethod, classmethod)): obj_next = obj_next.__func__
+        obj = obj_next
+    return ("callable" if callable(obj) else "value"), obj
+
+def _open_paren(before):
+    """is the cursor inside an unclosed `@(` or `@name(`?  -> index of its `@`, or None"""
+    for m in reversed(list(re.finditer(r"@(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)?\(", before))):
+        depth, i, quote = 0, m.end() - 1, ""
+        while i < len(before):
+            c = before[i]
+            if quote:
+                if c == "\\": i += 1
+                elif c == quote: quote = ""
+            elif c in "'\"": quote = c
+            elif c == "(": depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0: break
+            i += 1
+        if depth > 0: return None if quote else m.start()
+    return None
+
+def _name_items(prefix, source):
+    """completions for the name after `@`: (name, description) pairs. `source`: nothing is piped in."""
+    found = {}
+    if "." in prefix:
+        base, _, attr = prefix.rpartition(".")
+        state, obj = _static_lookup(base)
+        if obj is None: return []
+        for name in dir(obj):
+            if not name.startswith(attr) or (name.startswith("_") and not attr.startswith("_")): continue
+            what, value = _static_lookup(f"{base}.{name}")
+            if isinstance(value, types.ModuleType): found[f"{base}.{name}."] = "module"
+            elif what == "callable" or (source and what == "value"): found[f"{base}.{name}"] = _pydoc(value) or type(value).__name__
+        return sorted(found.items())
+    for name, value in list(ns.items()):
+        if name.startswith("_") or name in _NOT_STAGES or not name.startswith(prefix): continue
+        if isinstance(value, types.ModuleType): found[name + "."] = "module"
+        elif callable(value): found[name] = _pydoc(value) or "python function"
+        elif source and not isinstance(value, (bool, set, tuple)) and name not in ("import_cwd", "complete_ignore"):
+            found[name] = f"{type(value).__name__} to write into the pipe"
+    if prefix:                                             # built-ins only once something is typed: there are many
+        for name in dir(builtins):
+            if name.startswith(prefix) and name[0].islower(): found.setdefault(name, _pydoc(getattr(builtins, name)) or "built-in")
+    return sorted(found.items())
+
+def _python_completions(before, word, head, first):
+    """Tab inside Python parts of a shell line: `@name`, `name=@fn`, and inside `@(...)`. -> (head, items, nospace) or None."""
+    if _open_paren(before) is not None:
+        tail = re.search(r"(?:[A-Za-z_]\w*\.)*(?:[A-Za-z_]\w*)?$", before).group()
+        if not tail or (before[:len(before) - len(tail)][-1:] in ("'", '"')): return None
+        keep = before[:len(before) - len(tail)]
+        if "." in tail:
+            names = [(n.rstrip("."), d) for n, d in _name_items(tail, True)]
+        else:
+            pool = {k: v for k, v in ns.items() if not k.startswith("_")}
+            names = [(k, _pydoc(v) or type(v).__name__) for k, v in sorted(pool.items()) if k.startswith(tail)]
+            names += [(k, "built-in") for k in dir(builtins) if k.startswith(tail) and k[0].islower() and k not in pool]
+        return keep, [(n, n, d) for n, d in names], True
+    m = re.fullmatch(r"([A-Za-z_]\w*=)?@([\w.]*)", word)
+    if not m or not (first or (m.group(1) and "|" in head)): return None
+    assign, prefix = m.group(1) or "", m.group(2)
+    source = not head.rstrip().endswith("|") and not assign
+    items = [(f"{assign}@{n}", f"@{n}", d) for n, d in _name_items(prefix, source)]
+    if not source:
+        special = [("tee", "keep the raw text and show it")] if assign else [("tee", "show the data and pass it on")]
+        items += [(f"{assign}@{n}", f"@{n}", d) for n, d in special if n.startswith(prefix) and not any(i[0] == f"{assign}@{n}" for i in items)]
+    return head, items, False
+
+# --------------------------------------------------------------- highlighting
+_STAGE_HEAD = re.compile(r"(?<![^\s|;&])([A-Za-z_]\w*=)?@((?:[A-Za-z_]\w*)(?:\.[A-Za-z_]\w*)*\.?|(?=\())?")
+
+def _highlight_python_part(buf, i, command_position, piped):
+    """highlight an `@...` token starting at buf[i]. -> (coloured text, end index) or None if it isn't one"""
+    m = _STAGE_HEAD.match(buf, i)
+    if not m: return None
+    assign, name, end = m.group(1) or "", m.group(2), m.end()
+    if assign and not piped: return None                                 # `X=@y cmd` only sets an environment variable
+    opens = buf[end:end + 1] == "("
+    if not command_position and not opens: return None                   # `echo @x` is just text
+    if not command_position and name: return None                        # `echo @f(x)` too
+    out = assign
+    if name is None and not opens:                                       # a bare `@`, as in `name=@`
+        return (out + C(36, "@"), end) if assign else None
+    if name:
+        state = "callable" if name == "tee" else _static_lookup(name.rstrip("."))[0]
+        usable = state in ("callable", "unsure") or (state == "value" and not piped and not assign and not opens)
+        out += C(36 if usable else 31, "@" + name)
+    else: out += C(36, "@")
+    if opens:
+        depth, j, quote = 0, end, ""
+        while j < len(buf):
+            c = buf[j]
+            if quote:
+                if c == "\\": j += 1
+                elif c == quote: quote = ""
+            elif c in "'\"": quote = c
+            elif c == "(": depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0: break
+            j += 1
+        closed = j < len(buf) and depth == 0
+        out += C(36, "(") + _highlight_py(buf[end + 1:j]) + (C(36, ")") if closed else "")
+        end = j + 1 if closed else len(buf)
+    return out, end
 
 def highlight_sh(buf):
     out = []
-    cmd = True
-    for m in _SHTOK.finditer(buf):
+    cmd, piped, pos = True, False, 0
+    while pos < len(buf):
+        if buf[pos] == "@" or (cmd and re.match(r"[A-Za-z_]\w*=@", buf[pos:])):
+            if pos == 0 or buf[pos - 1] in " \t|;&":
+                redirected_in = re.search(r"(?<![<>0-9])<", buf[pos:]) is not None
+                part = _highlight_python_part(buf, pos, cmd, piped or redirected_in)
+                if part is not None:
+                    out.append(part[0]); pos = part[1]; cmd = False; continue
+        m = _SHTOK.match(buf, pos)
+        pos = m.end()
         k, t = m.lastgroup, m.group()
         if k == "w":
             if cmd and re.match(r"[A-Za-z_]\w*=", t): out.append(t); continue
             if cmd:
                 out.append(t); cmd = False                          # the program name keeps the default colour, like its arguments
-            elif t.startswith("$") or t.startswith("@("): out.append(C(36, t))
+            elif t.startswith("$"): out.append(C(36, t))
             elif os.path.exists(os.path.expanduser(t)) and not t.startswith("-"): out.append(f"\x1b[4m{t}\x1b[0m")
             else: out.append(t)
         elif k == "str": out.append(C(33, t)); cmd = False if not cmd else cmd
         elif k == "op":
             out.append(C(36, t))
-            if t in ("|", "||", "&&", ";", "&"): cmd = True
+            if t in ("|", "||", "&&", ";", "&"): cmd, piped = True, t == "|"
         elif k == "cm": out.append(C(90, t))
         else: out.append(t)
     return "".join(out)
@@ -2629,6 +2763,12 @@ def complete(before):
     stage = re.split(r"\|\||&&|[|;&]", head)[-1].split()
     first = not stage
     items, nospace = [], False          # items: (insert_word, display, desc)
+    python = _python_completions(before, word, head, first) if "@" in before else None
+    if python is not None:
+        head, items, nospace = python
+        if not items: return before, []
+        out = [(head + w + ("" if nospace or w.endswith(".") else " "), disp, desc) for w, disp, desc in items]
+        return head + os.path.commonprefix([w for w, _, _ in items]), out
     custom = None if first or word.startswith("$") else _custom_completions(word, stage)
     if custom is not None:
         items = custom

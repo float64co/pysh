@@ -579,8 +579,17 @@ and hold their text in memory.
 A
 .B sh()
 timeout stops the programs but cannot interrupt Python running in the shell.
-.B @name
-is not completed or highlighted.
+.PP
+While you type, a
+.BI @ name
+stage is cyan if it can work and red if it is not defined, or not callable where it has input.
+Tab after
+.B @
+offers your functions, imported modules, and built\-ins once a letter is typed;
+inside
+.B @( )
+it completes Python names.
+Neither runs any of your code.
 .SH PYSHLIB
 A module of extras built into pysh and loaded only when imported, for example in
 .IR ~/.pyshrc :

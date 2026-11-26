@@ -291,7 +291,10 @@ def users():
 - A pipeline ending in Python or a capture can't be suspended with Ctrl-Z; Ctrl-C interrupts it.
 - Captures can't be used with `&` or `![...]`. Captured text is held in memory.
 - `sh(..., timeout=...)` stops the programs in a pipeline but can't interrupt Python running in the shell.
-- Tab completion and highlighting don't know about `@name` yet.
+- **Typing `@name`:** it's cyan when it can be a stage and red when it can't (not defined, or not callable where
+  it has input). Tab offers your functions, imported modules (`@json.`) and, once you type a letter, built-ins;
+  inside `@( )` it completes Python names. Neither ever runs your code, so a name that could only be checked by
+  running a property is left unmarked.
 
 See `examples/logwatch.sh`, `examples/apipeek.sh` and `examples/inventory.sh`.
 
@@ -426,7 +429,7 @@ supports `--help`.
 ## Interactive features
 
 - **Autosuggestions**: grey text from history. `→`/`End`/`Ctrl-F` accept, `Alt-F` takes a word.
-- **Highlighting**: strings yellow, numbers and operators cyan, Python keywords blue, paths underlined. Program names keep the plain colour of their arguments.
+- **Highlighting**: strings yellow, numbers and operators cyan, Python keywords blue, paths underlined. Program names keep the plain colour of their arguments. Python stages (`@name`) are cyan, or red if they can't work.
 - **Fast on a slow `$PATH`**: command names are indexed in memory (listed in the background at startup and
   refreshed as directories change), so typing never searches `$PATH`. Under WSL, where Windows directories make
   one search take ~50 ms, that matters. A stale index can't misread a line: before treating a name as "not a

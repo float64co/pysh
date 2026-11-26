@@ -24,7 +24,7 @@ def local_check(name):
 
 def remote_check(host):
     # host and command are each one argument, whatever they contain
-    try: return sh("ssh -o BatchMode=yes -o ConnectTimeout=@(str(int(a.connect_timeout))) -- @(host) @(a.command)", timeout=a.timeout)
+    try: return sh("ssh -n -o BatchMode=yes -o ConnectTimeout=@(str(int(a.connect_timeout))) -- @(host) @(a.command)", timeout=a.timeout)
     except subprocess.TimeoutExpired: return Result(124, "", f"no answer within {a.timeout:g}s")
 
 ap = argparse.ArgumentParser(prog="fleet", description="Run a command on many hosts in parallel and tabulate the results.",

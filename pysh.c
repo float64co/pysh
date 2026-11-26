@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 
@@ -28,20 +29,36 @@
 
 static volatile sig_atomic_t g_winch;     /* set by SIGWINCH while a line is being edited */
 static void on_winch(int sig) { (void)sig; g_winch = 1; }
-static int pushback = -1;                 /* a key read ahead while coalescing typed/pasted text */
+/* Keys read ahead and given back: while coalescing typed or pasted text, or while waiting for the terminal to
+ * answer a question. */
+static unsigned char g_queue[512];
+static int g_qhead, g_qlen;
+static void unread(const char *s, int n) {
+    for (int i = 0; i < n && g_qlen < (int)sizeof g_queue; i++)
+        g_queue[(g_qhead + g_qlen++) % sizeof g_queue] = (unsigned char)s[i];
+}
+static int g_late;                        /* a cursor position report is overdue: it may still turn up */
 
 /* Next byte of input.  Returns -1 on timeout, -2 on EOF/error, and -3 (blocking reads only) when the
  * terminal was resized, so the editor can repaint. */
 /* Waiting for a key releases the GIL: Python threads (the $PATH index, the user's own) keep running at the prompt. */
-static int key(int timeout_ms) {
+static int term_byte(int timeout_ms) {            /* from the terminal, not the queue */
     unsigned char c;
-    if (pushback >= 0) { c = (unsigned char)pushback; pushback = -1; return c; }
     if (timeout_ms >= 0) {
         struct pollfd p = {0, POLLIN, 0};
-        int ready;
-        Py_BEGIN_ALLOW_THREADS
-        ready = poll(&p, 1, timeout_ms);
-        Py_END_ALLOW_THREADS
+        struct timespec start, now;
+        int ready, left = timeout_ms;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (;;) {
+            Py_BEGIN_ALLOW_THREADS
+            ready = poll(&p, 1, left);
+            Py_END_ALLOW_THREADS
+            if (ready >= 0 || errno != EINTR) break;
+            /* a signal (another resize) is not a timeout: wait out the rest */
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            left = timeout_ms - (int)((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000);
+            if (left < 0) left = 0;
+        }
         if (ready <= 0) return -1;
     }
     for (;;) {
@@ -59,6 +76,11 @@ static int key(int timeout_ms) {
         }
         return -2;
     }
+}
+
+static int key(int timeout_ms) {
+    if (g_qlen) { unsigned char c = g_queue[g_qhead]; g_qhead = (g_qhead + 1) % sizeof g_queue; g_qlen--; return c; }
+    return term_byte(timeout_ms);
 }
 
 static int is_cont(unsigned char c) { return (c & 0xC0) == 0x80; }
@@ -292,20 +314,27 @@ static void ins_key(char *buf, int *len, int *pos, int c) {
     ins(buf, len, pos, ch, n);
 }
 
-/* Ask the terminal where the cursor is (1-based).  Returns 0 if it doesn't answer within 200 ms. */
+/* Ask the terminal where the cursor is (1-based).  Returns 0 if it doesn't answer within 200 ms.  Anything
+ * else that arrives meanwhile (keys being typed, part of an answer) is kept for the editor to read. */
 static int cursor_pos(int *row, int *col) {
-    char b[48]; int n = 0;
-    pushback = -1;
+    char b[256]; int n = 0;
     outs("\x1b[6n");
-    for (;;) {
-        int c = key(200);
-        if (c < 0) return 0;
-        if (n < (int)sizeof b - 1) b[n++] = (char)c;
-        if (c == 'R') break;
+    while (n < (int)sizeof b - 1) {
+        int c = term_byte(200);
+        if (c < 0) break;
+        b[n++] = (char)c;
+        if (c != 'R') continue;
+        int at = n - 2, used = 0;                                    /* is this the end of ESC [ row ; col R? */
+        while (at >= 0 && b[at] != 0x1b) at--;
+        b[n] = 0;
+        if (at >= 0 && sscanf(b + at, "\x1b[%d;%dR%n", row, col, &used) == 2 && at + used == n) {
+            unread(b, at);
+            return 1;
+        }
     }
-    b[n] = 0;
-    char *p = strstr(b, "\x1b[");
-    return p && sscanf(p + 2, "%d;%d", row, col) == 2;
+    unread(b, n);
+    g_late = 1;
+    return 0;
 }
 
 /* Cursor position and the terminal's real width (it can differ from the pty's size for a moment while a
@@ -357,7 +386,7 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
     struct sigaction sa, old_sa;
     memset(&sa, 0, sizeof sa); sa.sa_handler = on_winch; sigemptyset(&sa.sa_mask);   /* no SA_RESTART: read() must wake */
     sigaction(SIGWINCH, &sa, &old_sa);
-    g_winch = 0; pushback = -1;
+    g_winch = 0; g_late = 0;
     int reflow = terminal_reflows();
     {   /* Safety net: if a child left itself as the terminal's foreground group (e.g. it died before exec), take it
          * back; otherwise our reads fail with EIO and the shell would think its input has ended. */
@@ -492,7 +521,7 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
             break;
         }
         case 27: {
-            int c1 = key(50);
+            int c1 = key(g_late ? 500 : 50);
             if (m_active && c1 == -1) {                       /* bare ESC cancels */
                 menu_close(); memcpy(buf, m_orig, m_origlen); len = m_origlen; pos = m_origpos;
                 break;
@@ -510,10 +539,18 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
             if (c1 == 'd') { del(buf, &len, pos, word_fwd(buf, len, pos), &pos); break; }
             if (c1 == 127) { del(buf, &len, word_back(buf, pos), pos, &pos); break; }
             if (c1 != '[' && c1 != 'O') { changed = 0; break; }
-            int c2 = key(50), arg = 0;
-            while (c2 >= '0' && c2 <= '9') { if (arg < 10000) arg = arg * 10 + (c2 - '0'); c2 = key(50); }
-            int mod = 0;
-            if (c2 == ';') { mod = key(50) - '0'; c2 = key(50); }
+            /* Read the whole sequence, however long, so no tail of one is ever taken as typing.  What follows
+             * "ESC [" is parameters (digits ; and such), then one final byte. */
+            int c2 = key(500), arg = 0, mod = 0, field = 0;
+            while (c1 == '[' && c2 >= 0x20 && c2 <= 0x3f) {
+                if (c2 == ';') field++;
+                else if (c2 >= '0' && c2 <= '9') {
+                    if (field == 0 && arg < 10000) arg = arg * 10 + (c2 - '0');
+                    else if (field == 1 && mod < 10000) mod = mod * 10 + (c2 - '0');
+                }
+                c2 = key(500);
+            }
+            if (c2 == 'R') { changed = 0; break; }       /* a cursor position report that came too late */
             if (m_active && (c2 == 'A' || c2 == 'B' || c2 == 'Z' || (!m_search && (c2 == 'C' || c2 == 'D')))) {
                 if (m_n == 0) { changed = 0; break; }
                 if (m_sel < 0) m_sel = (c2 == 'D' || c2 == 'A' || c2 == 'Z') ? (int)m_n - 1 : 0;
@@ -549,7 +586,7 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
                 for (;;) {                                  /* pasted/typed-ahead text: insert it all, repaint once */
                     int x = key(0);
                     if (x < 0) break;
-                    if (x < 32 || x == 127 || x == 0x1b) { pushback = x; break; }
+                    if (x < 32 || x == 127 || x == 0x1b) { char k = (char)x; unread(&k, 1); break; }
                     ins_key(buf, &len, &pos, x);
                 }
             } else changed = 0;

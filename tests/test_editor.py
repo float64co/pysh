@@ -1,5 +1,5 @@
 """Line-editor tests: pysh runs on a pty, its output is rendered by a small VT emulator (term.py)."""
-import os, re, tempfile, unittest
+import os, re, tempfile, unittest, time
 from term import Session
 
 HOST = os.uname().nodename.split(".")[0]
@@ -974,6 +974,31 @@ class Resize(EditorCase):
         s.resize(20, 40, quiet=0.8)
         self.assertEqual(len(self.prompts(s)), 2)                        # old one stays; new one below it
         self.assertIn("echo hello", self.logical_line(s, self.prompts(s)[-1]))
+
+    def answer_by_hand(self, respond):
+        """Type `echo abc`, resize, answer the cursor query as `respond` does, run the line -> what it printed."""
+        s = self.new_session(answer_dsr=False, env={"PYSH_RESIZE": "reflow"})
+        s.send("echo abc", 0.4)
+        mark, end = len(s.raw), time.time() + 5
+        s.resize(24, 60, quiet=0.02)
+        while b"\x1b[6n" not in s.raw[mark:] and time.time() < end: s.pump(0.01, 0.05)
+        respond(s)
+        s.pump(1.5)
+        mark = len(s.raw); s.send("\r", 1.0)
+        plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", s.raw[mark:].decode("utf-8", "replace"))
+        return [l.strip() for l in plain.replace("\r", "\n").split("\n") if l.strip().startswith("abc")][:1]
+
+    def test_a_late_cursor_report_is_not_typed_into_the_line(self):
+        def late(s): time.sleep(0.5); s.send("\x1b[3;45R", 0.1)
+        def split(s): s.send("\x1b[3", 0.02); time.sleep(0.4); s.send(";45R", 0.1)
+        def split_after_escape(s): s.send("\x1b", 0.02); time.sleep(0.4); s.send("[3;45R", 0.1)
+        for respond in (late, split, split_after_escape):
+            with self.subTest(respond.__name__):
+                self.assertEqual(self.answer_by_hand(respond), ["abc"])
+
+    def test_typing_while_the_terminal_is_being_asked_is_kept(self):
+        def typed(s): s.send("R", 0.02); s.send("xyz", 0.02); s.send("\x1b[3;24R", 0.05)
+        self.assertEqual(self.answer_by_hand(typed), ["abcRxyz"])
 
     @unittest.skipUnless(__import__("shutil").which("tmux"), "needs tmux (a real terminal that reflows)")
     def test_reflowing_terminal_real_tmux(self):

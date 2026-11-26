@@ -510,7 +510,7 @@ class Streaming(Base):
         self.assertOut("p = ![true]\np.wait()\nprint(p.result.returncode, bool(p.result))", "0 True")
 
     def test_context_manager_terminates_a_running_command(self):
-        self.assertOut("import time\nwith ![sh -c 'echo first; sleep 30'] as p:\n    print(p.readline().strip())\nprint(p.poll() is not None)", "first\nTrue")
+        self.assertOut("import time\nwith ![sh -c 'echo first; exec sleep 30'] as p:\n    print(p.readline().strip())\nprint(p.poll() is not None)", "first\nTrue")
 
     def test_readline_and_read(self):
         self.assertOut("p = ![printf 'a\\nb\\nc\\n']\nprint(repr(p.readline()), repr(p.read()))", "'a\\n' 'b\\nc\\n'")

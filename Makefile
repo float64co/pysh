@@ -48,6 +48,7 @@ clean:
 .PHONY: static clean install install-static
 
 # Tests run against ./pysh by default; PYSH=./pysh-static make test to try the other build.
+# JOBS=1 runs one test at a time.
 test: pysh
-	python3 -m unittest discover -s tests -v
+	python3 tests/run.py $(if $(JOBS),-j $(JOBS))
 .PHONY: test

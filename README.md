@@ -492,7 +492,8 @@ probe_flags = False` in `~/.pyshrc` to turn
 ## Tests
 
 ```sh
-make test                      # unittest suite in tests/ (shell, parser, line editor, job control)
+make test                      # the suite in tests/, in parallel, listing the slowest; JOBS=1 for one at a time
+python3 tests/run.py -k Parser # only the tests whose name contains this
 PYSH=./pysh-static python3 -m unittest discover -s tests -k Parser
 ```
 

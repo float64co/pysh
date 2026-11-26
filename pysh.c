@@ -53,6 +53,10 @@ static int key(int timeout_ms) {
         if (n == 1) return c;
         if (n == 0) return -2;
         if (errno == EINTR) { if (g_winch && timeout_ms < 0) return -3; continue; }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {          /* something left the terminal non-blocking */
+            int flags = fcntl(0, F_GETFL);
+            if (flags >= 0 && (flags & O_NONBLOCK) && fcntl(0, F_SETFL, flags & ~O_NONBLOCK) == 0) continue;
+        }
         return -2;
     }
 }
@@ -179,6 +183,7 @@ static int menu_draw(int tw, int th, int endrow) {
         if (w > colw) colw = w;
     }
     if (colw > tw - 3) colw = tw - 3;
+    if (colw < 1) colw = 1;                               /* a terminal a few columns wide */
     int cols = tw / (colw + 2); if (cols < 1 || m_search) cols = 1;
     int rows = (int)((m_n + cols - 1) / cols);
     int maxrows = th - endrow - 2; if (maxrows < 1) maxrows = 1;
@@ -506,7 +511,7 @@ static PyObject *le_readline(PyObject *self, PyObject *args) {
             if (c1 == 127) { del(buf, &len, word_back(buf, pos), pos, &pos); break; }
             if (c1 != '[' && c1 != 'O') { changed = 0; break; }
             int c2 = key(50), arg = 0;
-            while (c2 >= '0' && c2 <= '9') { arg = arg * 10 + (c2 - '0'); c2 = key(50); }
+            while (c2 >= '0' && c2 <= '9') { if (arg < 10000) arg = arg * 10 + (c2 - '0'); c2 = key(50); }
             int mod = 0;
             if (c2 == ';') { mod = key(50) - '0'; c2 = key(50); }
             if (m_active && (c2 == 'A' || c2 == 'B' || c2 == 'Z' || (!m_search && (c2 == 'C' || c2 == 'D')))) {
@@ -614,7 +619,24 @@ static PyObject *PyInit__pyshline(void) { return PyModule_Create(&le_mod); }
 
 /* ------------------------------------------------------------------ main */
 
+/* is there a standard library for this Python under `home` ("prefix" or "prefix:exec_prefix")? */
+static int has_stdlib(const char *home) {
+    static const char *const places[] = {"%.*s/lib/python%d.%d/os.py", "%.*s/lib64/python%d.%d/os.py",
+                                         "%.*s/lib/python%d.%d/encodings/__init__.pyc", "%.*s/lib/python%d%d.zip"};
+    int n = (int)strcspn(home, ":");
+    char path[4096];
+    for (size_t i = 0; i < sizeof places / sizeof *places; i++) {
+        int len = snprintf(path, sizeof path, places[i], n, home, PY_MAJOR_VERSION, PY_MINOR_VERSION);
+        if (len > 0 && len < (int)sizeof path && access(path, R_OK) == 0) return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    /* Started with a standard stream closed: put /dev/null there, so Python has all three and no file we open
+     * later lands on one of them. */
+    for (int fd = 0; fd <= 2; fd++)
+        if (fcntl(fd, F_GETFD) < 0 && open("/dev/null", O_RDWR) != fd) return 1;
     setlocale(LC_CTYPE, "");
     if (PyImport_AppendInittab("_pyshline", PyInit__pyshline) < 0) return 1;
 
@@ -627,7 +649,13 @@ int main(int argc, char **argv) {
     /* A static binary has no landmark files next to it; point at the same
      * prefix the system python uses so stdlib + site-packages resolve
      * identically.  PYTHONHOME still overrides. */
-    if (!getenv("PYTHONHOME")) {
+    /* A PYTHONHOME with no library in it (left over from another program or Python) would stop us starting:
+     * ignore it.  It is left in the environment for the commands we run. */
+    const char *ph = getenv("PYTHONHOME");
+    int use_env_home = ph && *ph && has_stdlib(ph);
+    if (ph && *ph && !use_env_home)
+        fprintf(stderr, "pysh: ignoring PYTHONHOME: no Python %d.%d library there\n", PY_MAJOR_VERSION, PY_MINOR_VERSION);
+    if (!use_env_home) {
         const char *h = getenv("PYSH_HOME");
         st = PyConfig_SetBytesString(&cfg, &cfg.home, h ? h : PYSH_HOME);
         if (PyStatus_Exception(st)) goto fail;

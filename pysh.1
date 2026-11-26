@@ -653,6 +653,13 @@ Every item is tried, and the stage then fails if any item did.
 With
 .B r=@par
 nothing is written and the results are assigned even if some failed.
+Blank lines and
+.B # comment
+lines in the input are not items.
+Each command runs in a copy of the shell with empty input, so
+.BR cd " and " export
+stay there.
+A function runs on a thread of the shell, and commands it starts inherit the shell's input.
 In a command
 .B {}
 is the item passed as one argument, so its contents are never read as shell syntax; it must not be quoted.
@@ -1182,6 +1189,8 @@ screen redraws).
 .B PYTHONHOME
 Takes precedence over
 .BR PYSH_HOME .
+If there is no library for pysh's Python version under it, pysh says so and ignores it;
+commands it runs still receive it.
 .SH EXIT STATUS
 The exit status of a script or
 .B \-c

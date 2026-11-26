@@ -340,7 +340,12 @@ cat hosts.txt | @par 'ssh {} uptime'        # in a pipeline, each line is an ite
 
 As a pipeline stage, `par` prints each command's output, in the items' order, and its error messages on
 standard error. Every item is tried; the stage then fails if any did, so a `-e` script stops there. With
-`r=@par ...` nothing is printed and the assignment succeeds: check `r` yourself.
+`r=@par ...` nothing is printed and the assignment succeeds: check `r` yourself. Blank lines and `# comment`
+lines in the input are not items.
+
+Each command runs in a copy of the shell with empty input: `cd`, `export` and aliases stay there, and `ssh`
+can't swallow what you type. A function runs on a thread of your shell, so give anything it runs its own
+input if that matters (`ssh -n`).
 
 Results come back in the items' order. In a command, `{}` is the item passed as **one argument**, so `;`,
 `$(...)` or spaces in a filename or hostname do nothing. A quoted `"{}"` is refused. An item starting with `-`

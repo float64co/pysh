@@ -1,6 +1,6 @@
 """Regression tests for the security review: untrusted programs/expressions must not run by accident,
 hostile text must not reach the terminal as escape sequences, secrets stay private, and nothing hangs."""
-import os, stat, subprocess, tempfile, time, unittest
+import os, select, stat, subprocess, sys, tempfile, time, unittest
 from helpers import Base, run, out, PYSH
 from term import Session
 
@@ -285,6 +285,52 @@ class MalformedInput(unittest.TestCase):
     def test_script_continues_after_a_malformed_line(self):
         r = run("echo $(\necho next")
         self.assertIn("syntax error", r.err); self.assertIn("next", r.out)
+
+
+class HostileStart(unittest.TestCase):
+    """what a parent process can hand us"""
+    def test_a_terminal_a_few_columns_wide_survives_the_menus(self):
+        for cols in (1, 2, 3):
+            with self.subTest(cols=cols):
+                s = Session(cols=cols, history=["echo one", "echo two"]); self.addCleanup(s.close)
+                for keys in ("ls --", "\x15", "e", "\t", "\t", "\x15", "\x12", "e"): s.send(keys, 0.3)
+                self.assertTrue(s.alive())
+
+    def test_a_huge_number_in_an_escape_sequence(self):
+        s = Session(); self.addCleanup(s.close)
+        s.send("\x1b[" + "9" * 40 + "~", 0.4)
+        s.send("echo ok$((1+1))\r", 0.6)
+        self.assertIn("ok2", s.text())
+
+    def test_stdin_left_non_blocking_by_the_parent(self):
+        parent = f"import os; os.set_blocking(0, False); os.execv({PYSH!r}, ['pysh'])"
+        pid, fd = os.forkpty()
+        if pid == 0:
+            os.execv(sys.executable, [sys.executable, "-c", f"import os; os.environ['HOME'] = {tempfile.mkdtemp()!r}; " + parent])
+        self.addCleanup(lambda: (os.kill(pid, 9), os.waitpid(pid, 0), os.close(fd)))
+        seen, end, sent = b"", time.time() + 15, False
+        while time.time() < end and b"ok2" not in seen:
+            if select.select([fd], [], [], 0.5)[0]: seen += os.read(fd, 65536)
+            elif not sent: os.write(fd, b"echo ok$((1+1))\r"); sent = True
+        self.assertIn(b"ok2", seen)
+
+    def test_closed_standard_streams(self):
+        for n in (0, 1, 2):
+            with self.subTest(fd=n):
+                r = subprocess.run([PYSH, "-c", "print('x')\ntrue"], capture_output=True, text=True, timeout=60,
+                                   preexec_fn=lambda: os.close(n))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+
+    def test_a_broken_pythonhome_is_ignored_but_passed_on(self):
+        for home in ("/nonexistent", "/tmp", "x" * 10000):
+            with self.subTest(home=home[:20]):
+                r = subprocess.run([PYSH, "-c", "import json, os\nprint(os.environ['PYTHONHOME'][:20])"], capture_output=True,
+                                   text=True, timeout=60, env=dict(os.environ, PYTHONHOME=home))
+                self.assertEqual((r.returncode, r.stdout), (0, home[:20] + "\n"), r.stderr)
+                self.assertIn("ignoring PYTHONHOME", r.stderr)
+        r = subprocess.run([PYSH, "-c", "true"], capture_output=True, text=True, timeout=60, env=dict(os.environ, PYTHONHOME="/usr"))
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
 
 
 if __name__ == "__main__":

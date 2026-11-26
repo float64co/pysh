@@ -214,6 +214,53 @@ class Par(Case):
         self.assertEqual(r.stdout, "1\n0\n", r.stderr)
         self.assertNotEqual(r.returncode, 0)
 
+    def test_cd_export_and_aliases_in_a_command_stay_there(self):
+        self.check("""
+            import os
+            os.mkdir("d1"); os.mkdir("d2")
+            start = os.getcwd()
+            print([os.path.basename(r.out.strip()) for r in par(["d1", "d2"], "cd {} && pwd", jobs=1)])
+            par(["x"], "export LEAKED={}")
+            par(["x"], "alias leaked={}")
+            par(["x"], "ASSIGNED={}")
+            print(os.getcwd() == start, "LEAKED" in os.environ, "ASSIGNED" in os.environ, "leaked" in aliases)
+            """, "['d1', 'd2']\nTrue False False False\n")
+
+    def test_commands_get_empty_input(self):
+        path = os.path.join(self.d, "t.pysh")
+        with open(path, "w") as f:
+            f.write("import sys\nfrom pyshlib import par\nprint(repr(par(['x'], 'cat {} -')[0].out))\nprint(repr(sys.stdin.read()))\n")
+        with open(os.path.join(self.d, "x"), "w") as f: f.write("file\n")
+        r = subprocess.run([PYSH, "-c", f"import sys\n$[{PYSH} t.pysh]"], input="mine\n", capture_output=True, text=True,
+                           timeout=60, cwd=self.d, env=dict(os.environ, HOME=self.d))
+        self.assertEqual(r.stdout, "'file\\n'\n'mine\\n'\n", r.stderr)
+
+    def test_messages_and_exit_from_a_command_are_in_its_result(self):
+        self.check("""
+            r = par(["nosuchdir"], "cd {}")[0]
+            print(r.returncode, "nosuchdir" in r.err)
+            print(par([3], "exit {}")[0].returncode)
+            print(len(par(range(40), "true {}", jobs=40)), len(par([1], "head -c 300000 /dev/zero {}")[0].err) > 0)
+            """, "1 True\n3\n40 True\n")
+
+    def test_ctrl_c_stops_the_commands_even_with_a_timeout(self):
+        running = lambda: subprocess.run(["pgrep", "-f", "^sleep 43\\.%d" % os.getpid()], capture_output=True).returncode == 0
+        for timeout in ("", ", timeout=60"):
+            with self.subTest(timeout=timeout):
+                s = Session(); self.addCleanup(s.close)
+                s.send("from pyshlib import par\r", 0.6)
+                s.send(f"par(range(3), 'sleep 43.{os.getpid()}{{}}'{timeout})\r", 1.0)
+                self.assertTrue(running())
+                s.send("\x03", 1.0); s.send("echo back$((40+2))\r", 1.0)
+                self.assertIn("back42", s.text())
+                self.assertFalse(running())
+
+    def test_blank_and_comment_lines_in_a_stream_are_not_items(self):
+        self.check("""
+            printf 'a\\n\\n   \\n# note\\n  ## more\\n#\\n#file#\\n' | @par 'echo {}'
+            print([r.item for r in par(["", "# kept"], "true {}")])
+            """, "a\n#file#\n['', '# kept']\n")
+
     def test_runs_in_parallel(self):
         t = time.time()
         self.sh("""par(range(6), "sh -c 'sleep 1' {}", jobs=6)\n""")

@@ -1,5 +1,5 @@
 # pysh -- embedded shell logic.  Executed by pysh.c inside __main__.
-import ast, builtins, codeop, collections, collections.abc, contextlib, glob, importlib, importlib.abc, importlib.util, json, inspect, io, keyword, operator, os, re, shlex, shutil, signal, site, subprocess, sys, tempfile, threading, time, traceback, types, warnings
+import ast, builtins, codeop, collections, collections.abc, contextlib, glob, importlib, importlib.abc, importlib.util, json, inspect, io, keyword, operator, os, re, shlex, shutil, signal, site, subprocess, sys, tempfile, threading, time, traceback, types, warnings, pickle, selectors
 
 VERSION = "0.0.3"
 shell = sys.modules["__main__"]                # pysh's own internals: shell.jobs, shell.history, ...
@@ -1099,7 +1099,9 @@ def _child_setup_bg():
 
 class _Killer:
     """Ends a command `timeout` seconds after it started: SIGTERM, then SIGKILL two seconds later."""
+    active = set()           # those still counting: their commands are in groups of their own, out of Ctrl-C's reach
     def __init__(self, timeout, pids, pgid=None):
+        _Killer.active.add(self)
         self.fired, self.pids, self.pgid, self.t2 = False, list(pids), pgid, None
         self.t = threading.Timer(timeout, self.fire); self.t.daemon = True; self.t.start()
     def _sig(self, s):
@@ -1114,6 +1116,7 @@ class _Killer:
         self.fired = True; self._sig(signal.SIGTERM)
         self.t2 = threading.Timer(2.0, lambda: self._sig(signal.SIGKILL)); self.t2.daemon = True; self.t2.start()
     def cancel(self):
+        _Killer.active.discard(self)
         self.t.cancel()
         if self.t2: self.t2.cancel()
 
@@ -1678,6 +1681,77 @@ def _fork_stage(node, fds, others, pgid, foreground):
         except OSError: pass
     finally:
         os._exit(status)                                # never return into the shell's own code
+
+_RESULT_FIELDS = ("returncode", "out", "err", "duration", "cmd", "timed_out", "no_match", "_statuses")
+
+def _isolated_stop(signum, frame):
+    """Interrupted: pass it to the commands that have their own process group, then go."""
+    for killer in list(_Killer.active): killer._sig(signum)
+    os._exit(128 + signum)
+
+def _isolated_child(call, out_fd):
+    """In a fork: run `call`, which returns a Result, with empty input, and send the Result back."""
+    global INTERACTIVE
+    status = 1
+    try:
+        _Killer.active.clear()
+        signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+        for s in (signal.SIGINT, signal.SIGTERM): signal.signal(s, _isolated_stop)
+        INTERACTIVE = False; jobs.clear()          # (job-control stop signals stay ignored, as the shell has them)
+        null = os.open(os.devnull, os.O_RDWR)
+        os.dup2(null, 0)
+        if null: os.close(null)
+        sys.stdin = open(0, "r", errors="replace", closefd=False)
+        sys.stdout, sys.stderr = io.StringIO(), io.StringIO()      # the shell's own messages belong to the result
+        try: r = call()
+        except SystemExit as e: r = Result(exit_status(e), "", "")
+        except BaseException as e: r = Result(1, "", "".join(traceback.format_exception_only(type(e), e)))
+        if sys.stderr.getvalue(): r.err = (r.err or "") + sys.stderr.getvalue()
+        data = pickle.dumps({k: getattr(r, k) for k in _RESULT_FIELDS})
+        with os.fdopen(out_fd, "wb") as f: f.write(data)
+        status = 0
+    finally:
+        os._exit(status)                                # never return into the shell's own code
+
+def run_isolated(calls, jobs):
+    """Run each call in a forked copy of the shell, `jobs` at a time, so that `cd`, `export` and the like stay
+    there.  -> their Results, in order."""
+    results, running = [None] * len(calls), {}          # read fd -> (index, pid, bytes so far)
+    waiting = list(enumerate(calls))[::-1]
+    sys.stdout.flush(); sys.stderr.flush()
+    with selectors.DefaultSelector() as ready:
+        try:
+            while waiting or running:
+                while waiting and len(running) < jobs:
+                    index, call = waiting.pop()
+                    r, w = os.pipe()
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", DeprecationWarning)
+                        pid = os.fork()
+                    if not pid:
+                        os.close(r)
+                        for other in running: os.close(other)
+                        _isolated_child(call, w)
+                    os.close(w)
+                    running[r] = (index, pid, bytearray())
+                    ready.register(r, selectors.EVENT_READ)
+                for key, _ in ready.select():
+                    index, pid, data = running[key.fd]
+                    chunk = os.read(key.fd, 65536)
+                    if chunk: data += chunk; continue
+                    ready.unregister(key.fd); os.close(key.fd); del running[key.fd]
+                    try: code = _status(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
+                    except ChildProcessError: code = 1
+                    result = Result()
+                    if data: result.__dict__.update(pickle.loads(bytes(data)))
+                    else: result = Result(code or 1, "", "")            # killed before it could answer
+                    results[index] = result
+        finally:                                        # interrupted: leave nothing running or unreaped
+            for fd, (_, pid, _) in running.items():
+                os.close(fd)
+                try: os.kill(pid, signal.SIGTERM); os.waitpid(pid, 0)
+                except OSError: pass
+    return results
 
 def _tap(node, in_fd, out_fd, show_fd):
     """The shell copies a stage's data, keeping it (and showing it): name=@, name=@tee, @tee."""
@@ -3154,6 +3228,10 @@ def run_startup(norc):
 
 def main(argv):
     global _batch, _errexit
+    for fd in (0, 1, 2):                     # a parent may leave the terminal non-blocking: reads would fail
+        try:
+            if (fd == 0 or os.isatty(fd)) and not os.get_blocking(fd): os.set_blocking(fd, True)
+        except OSError: pass
     fix_pwd()
     try: opts, args = parse_options(list(argv[1:]))
     except ValueError as e: sh_error(f"unknown option {e}"); print(USAGE, file=sys.stderr); return 2

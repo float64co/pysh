@@ -244,9 +244,14 @@ def par(items, command, jobs=8, timeout=None):
 
     As a stage it prints each command's output and errors, and fails if any item did (after trying them all).
 
+    Each command runs in a copy of the shell with empty input, so `cd` and `export` in it stay there. A function
+    runs on a thread of this shell. From a stream, blank lines and `# comment` lines are not items.
+
     In a command, {} is the item as ONE argument, so spaces or `;` in it do nothing. Don't quote it. An item
     starting with `-` is still read as an option by many programs: put `--` before {} if that matters."""
-    items = list(_lines(items) if hasattr(items, "read") else items)       # a stream: a pipeline stage, or a file
+    if hasattr(items, "read"):                          # a stream: a pipeline stage, or a file
+        items = (line for line in _lines(items) if line.strip() and not re.match(r"\s*#+(\s|$)", line))
+    items = list(items)
     if int(jobs) < 1: raise ValueError("par: jobs must be at least 1")
     if callable(command): run = command
     else:
@@ -257,15 +262,18 @@ def par(items, command, jobs=8, timeout=None):
             try: result = shell_sh(text, timeout=timeout)
             except subprocess.TimeoutExpired:
                 result = _shell.Result(124, "", "", timeout, command); result.timed_out = True
-            result.item = item
             return result
     errexit, _shell._errexit = _shell._errexit, False             # a failing item is a result, not the end of the script
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=int(jobs))
+    pool = None
     try:
-        results = pool.map(run, items)
-        return list(results) if callable(command) else _Results(results)
+        if not callable(command):                       # processes: a builtin must not change this shell
+            results = _Results(_shell.run_isolated([functools.partial(run, item) for item in items], int(jobs)))
+            for item, result in zip(items, results): result.item = item
+            return results
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=int(jobs))
+        return list(pool.map(run, items))
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        if pool: pool.shutdown(wait=False, cancel_futures=True)
         _shell._errexit = errexit
 
 # ------------------------------------------------------------ history
